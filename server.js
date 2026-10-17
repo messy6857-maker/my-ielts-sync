@@ -1,0 +1,126 @@
+// my-ielts sync server: 账号 + 学习数据多设备同步
+// 跑法: PORT=3001 JWT_SECRET=xxx node server.js
+// 数据: ./data/sync.db (SQLite)
+
+const fs = require('fs')
+const path = require('path')
+const crypto = require('crypto')
+const express = require('express')
+const cors = require('cors')
+const rateLimit = require('express-rate-limit')
+const bcrypt = require('bcryptjs')
+const jwt = require('jsonwebtoken')
+const Database = require('better-sqlite3')
+
+const PORT = Number(process.env.PORT || 3001)
+const DATA_DIR = process.env.DATA_DIR || path.join(__dirname, 'data')
+fs.mkdirSync(DATA_DIR, { recursive: true })
+
+// JWT 密钥：环境变量优先，否则生成并落盘
+const SECRET_FILE = path.join(DATA_DIR, '.jwt_secret')
+let JWT_SECRET = process.env.JWT_SECRET
+if (!JWT_SECRET) {
+  if (fs.existsSync(SECRET_FILE)) {
+    JWT_SECRET = fs.readFileSync(SECRET_FILE, 'utf8').trim()
+  } else {
+    JWT_SECRET = crypto.randomBytes(48).toString('hex')
+    fs.writeFileSync(SECRET_FILE, JWT_SECRET, { mode: 0o600 })
+    console.log('generated new JWT secret')
+  }
+}
+
+const db = new Database(path.join(DATA_DIR, 'sync.db'))
+db.pragma('journal_mode = WAL')
+db.exec(`
+  CREATE TABLE IF NOT EXISTS users (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    username TEXT UNIQUE NOT NULL,
+    password_hash TEXT NOT NULL,
+    created_at INTEGER NOT NULL
+  );
+  CREATE TABLE IF NOT EXISTS sync_data (
+    user_id INTEGER PRIMARY KEY,
+    data TEXT NOT NULL,
+    updated_at INTEGER NOT NULL,
+    FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+  );
+`)
+
+const USERNAME_RE = /^[a-zA-Z0-9_\u4e00-\u9fa5]{2,20}$/
+
+const app = express()
+app.use(cors()) // 前端在 GitHub Pages，允许跨域
+app.use(express.json({ limit: '5mb' })) // 学习数据 blob 上限 5MB
+
+// 登录/注册接口限流：防爆破
+const authLimiter = rateLimit({ windowMs: 15 * 60 * 1000, max: 60 })
+
+app.get('/api/health', (req, res) => res.json({ ok: true, ts: Date.now() }))
+
+app.post('/api/register', authLimiter, async (req, res) => {
+  const username = String(req.body?.username || '').trim()
+  const password = String(req.body?.password || '')
+  if (!USERNAME_RE.test(username))
+    return res.status(400).json({ ok: false, message: '用户名需为 2-20 位字母、数字、下划线或中文' })
+  if (password.length < 4)
+    return res.status(400).json({ ok: false, message: '密码至少 4 位' })
+  const exists = db.prepare('SELECT id FROM users WHERE username = ?').get(username)
+  if (exists)
+    return res.status(409).json({ ok: false, message: '用户名已存在，换一个吧' })
+  const hash = await bcrypt.hash(password, 10)
+  const info = db.prepare('INSERT INTO users (username, password_hash, created_at) VALUES (?, ?, ?)')
+    .run(username, hash, Date.now())
+  const token = jwt.sign({ uid: info.lastInsertRowid, username }, JWT_SECRET, { expiresIn: '30d' })
+  res.json({ ok: true, token, username })
+})
+
+app.post('/api/login', authLimiter, async (req, res) => {
+  const username = String(req.body?.username || '').trim()
+  const password = String(req.body?.password || '')
+  const user = db.prepare('SELECT * FROM users WHERE username = ?').get(username)
+  if (!user)
+    return res.status(401).json({ ok: false, message: '用户不存在，请先注册' })
+  const match = await bcrypt.compare(password, user.password_hash)
+  if (!match)
+    return res.status(401).json({ ok: false, message: '密码不正确' })
+  const token = jwt.sign({ uid: user.id, username }, JWT_SECRET, { expiresIn: '30d' })
+  res.json({ ok: true, token, username })
+})
+
+function auth(req, res, next) {
+  const header = req.headers.authorization || ''
+  const token = header.startsWith('Bearer ') ? header.slice(7) : null
+  if (!token)
+    return res.status(401).json({ ok: false, message: '未登录' })
+  try {
+    req.user = jwt.verify(token, JWT_SECRET)
+    next()
+  } catch {
+    return res.status(401).json({ ok: false, message: '登录已过期，请重新登录' })
+  }
+}
+
+// 拉取： whole blob
+app.get('/api/sync', auth, (req, res) => {
+  const row = db.prepare('SELECT data, updated_at FROM sync_data WHERE user_id = ?').get(req.user.uid)
+  if (!row)
+    return res.json({ ok: true, data: null, updatedAt: 0 })
+  res.json({ ok: true, data: JSON.parse(row.data), updatedAt: row.updated_at })
+})
+
+// 推送： whole blob 整体覆盖（last-write-wins）
+app.put('/api/sync', auth, (req, res) => {
+  const data = req.body?.data
+  if (!data || typeof data !== 'object' || Array.isArray(data))
+    return res.status(400).json({ ok: false, message: '数据格式不正确' })
+  const now = Date.now()
+  db.prepare(`
+    INSERT INTO sync_data (user_id, data, updated_at) VALUES (?, ?, ?)
+    ON CONFLICT(user_id) DO UPDATE SET data = excluded.data, updated_at = excluded.updated_at
+  `).run(req.user.uid, JSON.stringify(data), now)
+  res.json({ ok: true, updatedAt: now })
+})
+
+app.listen(PORT, '127.0.0.1', () => {
+  console.log(`my-ielts sync server listening on 127.0.0.1:${PORT}`)
+})

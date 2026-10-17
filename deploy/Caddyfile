@@ -1,0 +1,5 @@
+# my-ielts sync API 反向代理
+# 域名解析到本机公网 IP 即可，Caddy 自动申请 Let's Encrypt 证书
+38-64-63-20.sslip.io {
+	reverse_proxy 127.0.0.1:3001
+}

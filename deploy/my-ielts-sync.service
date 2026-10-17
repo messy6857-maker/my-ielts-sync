@@ -1,0 +1,17 @@
+[Unit]
+Description=my-ielts sync server
+After=network.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/opt/my-ielts-sync
+ExecStart=/usr/bin/node /opt/my-ielts-sync/server.js
+Restart=always
+RestartSec=5
+Environment=PORT=3001
+Environment=DATA_DIR=/opt/my-ielts-sync/data
+# JWT_SECRET 不设则首次启动自动生成并落盘到 DATA_DIR/.jwt_secret
+
+[Install]
+WantedBy=multi-user.target
