@@ -10,7 +10,7 @@ SRC_DIR="$(dirname "$SCRIPT_DIR")"
 echo "==> 1/5 安装 Node.js 20"
 if ! command -v node >/dev/null 2>&1; then
   apt-get update -qq
-  apt-get install -y -qq ca-certificates curl gnupg
+  apt-get install -y -qq ca-certificates curl gnupg git
   mkdir -p /etc/apt/keyrings
   curl -fsSL https://deb.nodesource.com/gpgkey/nodesource-repo.gpg.key \
     | gpg --dearmor -o /etc/apt/keyrings/nodesource.gpg
