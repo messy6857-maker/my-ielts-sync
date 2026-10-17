@@ -1,16 +1,16 @@
 // my-ielts sync server: 账号 + 学习数据多设备同步
-// 跑法: PORT=3001 JWT_SECRET=xxx node server.js
-// 数据: ./data/sync.db (SQLite)
+// 跑法: node --experimental-sqlite server.js  (Node 22+)
+// 数据: ./data/sync.db (SQLite，Node 内置 node:sqlite，零 native 依赖)
 
 const fs = require('fs')
 const path = require('path')
 const crypto = require('crypto')
+const { DatabaseSync } = require('node:sqlite')
 const express = require('express')
 const cors = require('cors')
 const rateLimit = require('express-rate-limit')
 const bcrypt = require('bcryptjs')
 const jwt = require('jsonwebtoken')
-const Database = require('better-sqlite3')
 
 const PORT = Number(process.env.PORT || 3001)
 const DATA_DIR = process.env.DATA_DIR || path.join(__dirname, 'data')
@@ -29,8 +29,8 @@ if (!JWT_SECRET) {
   }
 }
 
-const db = new Database(path.join(DATA_DIR, 'sync.db'))
-db.pragma('journal_mode = WAL')
+const db = new DatabaseSync(path.join(DATA_DIR, 'sync.db'))
+db.exec('PRAGMA journal_mode = WAL')
 db.exec(`
   CREATE TABLE IF NOT EXISTS users (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -68,9 +68,9 @@ app.post('/api/register', authLimiter, async (req, res) => {
   if (exists)
     return res.status(409).json({ ok: false, message: '用户名已存在，换一个吧' })
   const hash = await bcrypt.hash(password, 10)
-  const info = db.prepare('INSERT INTO users (username, password_hash, created_at) VALUES (?, ?, ?)')
+  const result = db.prepare('INSERT INTO users (username, password_hash, created_at) VALUES (?, ?, ?)')
     .run(username, hash, Date.now())
-  const token = jwt.sign({ uid: info.lastInsertRowid, username }, JWT_SECRET, { expiresIn: '30d' })
+  const token = jwt.sign({ uid: Number(result.lastInsertRowid), username }, JWT_SECRET, { expiresIn: '30d' })
   res.json({ ok: true, token, username })
 })
 

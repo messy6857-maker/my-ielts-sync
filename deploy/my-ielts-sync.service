@@ -6,7 +6,7 @@ After=network.target
 Type=simple
 User=root
 WorkingDirectory=/opt/my-ielts-sync
-ExecStart=/usr/bin/node /opt/my-ielts-sync/server.js
+ExecStart=/usr/bin/node --experimental-sqlite /opt/my-ielts-sync/server.js
 Restart=always
 RestartSec=5
 Environment=PORT=3001

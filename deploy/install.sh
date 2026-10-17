@@ -7,14 +7,24 @@ APP_DIR=/opt/my-ielts-sync
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 SRC_DIR="$(dirname "$SCRIPT_DIR")"
 
-echo "==> 1/5 安装 Node.js 20"
+echo "==> 1/5 安装 Node.js 22"
+NEED_NODE=0
 if ! command -v node >/dev/null 2>&1; then
+  NEED_NODE=1
+else
+  NODE_MAJOR=$(node --version | cut -d. -f1 | tr -dc '0-9')
+  if [ "$NODE_MAJOR" -lt 22 ]; then
+    echo "检测到 Node $NODE_MAJOR，升级到 Node 22（需要内置 SQLite）"
+    NEED_NODE=1
+  fi
+fi
+if [ "$NEED_NODE" = 1 ]; then
   apt-get update -qq
   apt-get install -y -qq ca-certificates curl gnupg git
   mkdir -p /etc/apt/keyrings
   curl -fsSL https://deb.nodesource.com/gpgkey/nodesource-repo.gpg.key \
     | gpg --dearmor -o /etc/apt/keyrings/nodesource.gpg
-  echo "deb [signed-by=/etc/apt/keyrings/nodesource.gpg] https://deb.nodesource.com/node_20.x nodistro main" \
+  echo "deb [signed-by=/etc/apt/keyrings/nodesource.gpg] https://deb.nodesource.com/node_22.x nodistro main" \
     > /etc/apt/sources.list.d/nodesource.list
   apt-get update -qq
   apt-get install -y -qq nodejs
@@ -37,12 +47,16 @@ echo "==> 3/5 部署应用到 $APP_DIR"
 mkdir -p "$APP_DIR/data"
 cp "$SRC_DIR/server.js" "$SRC_DIR/package.json" "$APP_DIR/"
 cd "$APP_DIR"
+# 仅安装纯 JS 依赖（无 native 模块）；如已有 node_modules 则先清理，避免残留 better-sqlite3
+rm -rf node_modules/better-sqlite3
 npm install --omit=dev --no-audit --no-fund -qq
-# better-sqlite3 需要编译，装好 build 工具（若已有则跳过）
-if ! node -e "require('better-sqlite3')" 2>/dev/null; then
-  apt-get install -y -qq python3 make g++
-  npm rebuild better-sqlite3
-fi
+echo "==> 3.5/5 自检：SQLite + 服务启动冒烟测试"
+node --experimental-sqlite -e "
+const { DatabaseSync } = require('node:sqlite');
+const db = new DatabaseSync(':memory:');
+db.exec('CREATE TABLE t(a)');
+console.log('node:sqlite OK');
+"
 
 echo "==> 4/5 配置 systemd 服务"
 cp "$SCRIPT_DIR/my-ielts-sync.service" /etc/systemd/system/

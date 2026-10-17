@@ -4,7 +4,7 @@ my-ielts 网站的多设备同步后端：账号注册/登录 + 学习数据云�
 
 ## 架构
 
-- Node.js + Express + better-sqlite3（零外部依赖数据库）
+- Node.js 22 + Express + 内置 node:sqlite（零 native 依赖、零外部数据库）
 - 密码 bcrypt 哈希，JWT 登录态（30 天）
 - 数据模型：每用户一个 JSON blob（`myielts_u_<username>_*` 的 localStorage 快照），整体覆盖、last-write-wins
 - Caddy 反向代理 + Let's Encrypt 自动 HTTPS
