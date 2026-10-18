@@ -14,6 +14,7 @@ const jwt = require('jsonwebtoken')
 
 const PORT = Number(process.env.PORT || 3001)
 const DATA_DIR = process.env.DATA_DIR || path.join(__dirname, 'data')
+const CRON_TOKEN = process.env.CRON_TOKEN || ''
 fs.mkdirSync(DATA_DIR, { recursive: true })
 
 // JWT 密钥：环境变量优先，否则生成并落盘
@@ -109,6 +110,36 @@ app.get('/api/sync', auth, (req, res) => {
 })
 
 // 推送： whole blob 整体覆盖（last-write-wins）
+// 定时任务专用：获取某用户某天学过的单词 ID（只读，需 X-Cron-Token）
+// studiedAt 用 dueAt - interval 反推；date 为北京时间 YYYY-MM-DD
+app.get('/api/cron/studied-words', (req, res) => {
+  const token = req.headers['x-cron-token']
+  if (!CRON_TOKEN || token !== CRON_TOKEN)
+    return res.status(401).json({ ok: false, message: 'unauthorized' })
+  const { username, date } = req.query
+  if (!username || !date || !/^\d{4}-\d{2}-\d{2}$/.test(date))
+    return res.status(400).json({ ok: false, message: '需要 username 和 date(YYYY-MM-DD)' })
+  const user = db.prepare('SELECT id FROM users WHERE username = ?').get(username)
+  if (!user)
+    return res.status(404).json({ ok: false, message: '用户不存在' })
+  const row = db.prepare('SELECT data FROM sync_data WHERE user_id = ?').get(user.id)
+  if (!row)
+    return res.json({ ok: true, date, count: 0, words: [] })
+  const blob = JSON.parse(row.data)
+  const sched = JSON.parse(blob[`myielts_u_${username}_sr_vocabulary_v1`] || '{}')
+  const dayStart = new Date(date + 'T00:00:00+08:00').getTime()
+  const dayEnd = dayStart + 86400000
+  const words = []
+  for (const [id, s] of Object.entries(sched)) {
+    if (!s || typeof s.dueAt !== 'number' || typeof s.interval !== 'number')
+      continue
+    const studiedAt = s.dueAt - s.interval * 86400000
+    if (studiedAt >= dayStart && studiedAt < dayEnd)
+      words.push(id)
+  }
+  res.json({ ok: true, date, count: words.length, words })
+})
+
 app.put('/api/sync', auth, (req, res) => {
   const data = req.body?.data
   if (!data || typeof data !== 'object' || Array.isArray(data))
