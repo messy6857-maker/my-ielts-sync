@@ -45,6 +45,14 @@ db.exec(`
     updated_at INTEGER NOT NULL,
     FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
   );
+  CREATE TABLE IF NOT EXISTS daily_readings (
+    date TEXT NOT NULL,
+    user_id INTEGER NOT NULL,
+    data TEXT NOT NULL,
+    created_at INTEGER NOT NULL,
+    PRIMARY KEY (date, user_id),
+    FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+  );
 `)
 
 const USERNAME_RE = /^[a-zA-Z0-9_\u4e00-\u9fa5]{2,20}$/
@@ -119,6 +127,33 @@ app.get('/api/cron/users', (req, res) => {
     return res.status(401).json({ ok: false, message: 'unauthorized' })
   const rows = db.prepare('SELECT username FROM users ORDER BY username').all()
   res.json({ ok: true, count: rows.length, users: rows.map(r => r.username) })
+})
+// 定时任务专用：存入某用户某天的词汇阅读（只读，需 X-Cron-Token）
+app.post('/api/cron/daily-reading', (req, res) => {
+  const token = req.headers['x-cron-token']
+  if (!CRON_TOKEN || token !== CRON_TOKEN)
+    return res.status(401).json({ ok: false, message: 'unauthorized' })
+  const { username, date, reading } = req.body || {}
+  if (!username || !date || !/^\d{4}-\d{2}-\d{2}$/.test(date) || !reading || typeof reading !== 'object')
+    return res.status(400).json({ ok: false, message: '需要 username、date(YYYY-MM-DD)、reading' })
+  const user = db.prepare('SELECT id FROM users WHERE username = ?').get(username)
+  if (!user)
+    return res.status(404).json({ ok: false, message: '用户不存在' })
+  db.prepare(`INSERT INTO daily_readings (date, user_id, data, created_at)
+              VALUES (?, ?, ?, ?)
+              ON CONFLICT(date, user_id) DO UPDATE SET data = excluded.data, created_at = excluded.created_at`)
+    .run(date, user.id, JSON.stringify(reading), Date.now())
+  res.json({ ok: true })
+})
+// 用户取自己的词汇阅读（需登录 JWT，只能拿自己的）
+app.get('/api/daily-reading', auth, (req, res) => {
+  const { date } = req.query
+  if (!date || !/^\d{4}-\d{2}-\d{2}$/.test(date))
+    return res.status(400).json({ ok: false, message: '需要 date(YYYY-MM-DD)' })
+  const row = db.prepare('SELECT data FROM daily_readings WHERE date = ? AND user_id = ?').get(date, req.userId)
+  if (!row)
+    return res.json({ ok: true, date, reading: null })
+  res.json({ ok: true, date, reading: JSON.parse(row.data) })
 })
 app.get('/api/cron/studied-words', (req, res) => {
   const token = req.headers['x-cron-token']
