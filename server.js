@@ -112,6 +112,14 @@ app.get('/api/sync', auth, (req, res) => {
 // 推送： whole blob 整体覆盖（last-write-wins）
 // 定时任务专用：获取某用户某天学过的单词 ID（只读，需 X-Cron-Token）
 // studiedAt 用 dueAt - interval 反推；date 为北京时间 YYYY-MM-DD
+// 定时任务专用：列出所有用户名（只读，需 X-Cron-Token），用于按账号生成每日阅读
+app.get('/api/cron/users', (req, res) => {
+  const token = req.headers['x-cron-token']
+  if (!CRON_TOKEN || token !== CRON_TOKEN)
+    return res.status(401).json({ ok: false, message: 'unauthorized' })
+  const rows = db.prepare('SELECT username FROM users ORDER BY username').all()
+  res.json({ ok: true, count: rows.length, users: rows.map(r => r.username) })
+})
 app.get('/api/cron/studied-words', (req, res) => {
   const token = req.headers['x-cron-token']
   if (!CRON_TOKEN || token !== CRON_TOKEN)
