@@ -150,7 +150,7 @@ app.get('/api/daily-reading', auth, (req, res) => {
   const { date } = req.query
   if (!date || !/^\d{4}-\d{2}-\d{2}$/.test(date))
     return res.status(400).json({ ok: false, message: '需要 date(YYYY-MM-DD)' })
-  const row = db.prepare('SELECT data FROM daily_readings WHERE date = ? AND user_id = ?').get(date, req.userId)
+  const row = db.prepare('SELECT data FROM daily_readings WHERE date = ? AND user_id = ?').get(date, req.user.uid)
   if (!row)
     return res.json({ ok: true, date, reading: null })
   res.json({ ok: true, date, reading: JSON.parse(row.data) })
