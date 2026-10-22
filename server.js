@@ -196,10 +196,9 @@ app.put('/api/sync', auth, (req, res) => {
 })
 
 // AI 中转：浏览器直连第三方 API 会被 CORS 拦截，走服务端转发
-// 仅 messy 可用（与前端 AI 批改权限一致）
+// 所有登录账号可用，每人用自己的 API Key
 app.post('/api/ai/chat', auth, async (req, res) => {
-  if (req.user.username !== 'messy')
-    return res.status(403).json({ ok: false, message: 'AI 功能仅限站长账号使用' })
+  // 所有登录账号可用，每人用自己的 API Key
   const { baseUrl, apiKey, model, messages, temperature } = req.body || {}
   if (!baseUrl || !apiKey || !model || !Array.isArray(messages))
     return res.status(400).json({ ok: false, message: '缺少 baseUrl/apiKey/model/messages' })
