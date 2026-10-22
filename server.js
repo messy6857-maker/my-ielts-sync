@@ -195,6 +195,42 @@ app.put('/api/sync', auth, (req, res) => {
   res.json({ ok: true, updatedAt: now })
 })
 
+// AI 中转：浏览器直连第三方 API 会被 CORS 拦截，走服务端转发
+// 仅 messy 可用（与前端 AI 批改权限一致）
+app.post('/api/ai/chat', auth, async (req, res) => {
+  if (req.user.username !== 'messy')
+    return res.status(403).json({ ok: false, message: 'AI 功能仅限站长账号使用' })
+  const { baseUrl, apiKey, model, messages, temperature } = req.body || {}
+  if (!baseUrl || !apiKey || !model || !Array.isArray(messages))
+    return res.status(400).json({ ok: false, message: '缺少 baseUrl/apiKey/model/messages' })
+  // 只允许 https 地址
+  let url
+  try {
+    url = new URL(baseUrl.replace(/\/+$/, '') + '/chat/completions')
+    if (url.protocol !== 'https:')
+      throw new Error('only https')
+  } catch {
+    return res.status(400).json({ ok: false, message: 'API 地址不合法' })
+  }
+  try {
+    const r = await fetch(url, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': 'Bearer ' + apiKey,
+      },
+      body: JSON.stringify({ model, messages, temperature: temperature ?? 0.3 }),
+      signal: AbortSignal.timeout(120000),
+    })
+    const data = await r.json().catch(() => null)
+    if (!r.ok)
+      return res.status(r.status).json({ ok: false, message: 'AI 接口返回 ' + r.status, data })
+    res.json({ ok: true, data })
+  } catch (e) {
+    res.status(502).json({ ok: false, message: 'AI 接口请求失败' })
+  }
+})
+
 app.listen(PORT, '127.0.0.1', () => {
   console.log(`my-ielts sync server listening on 127.0.0.1:${PORT}`)
 })
