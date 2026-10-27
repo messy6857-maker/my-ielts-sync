@@ -169,3 +169,7 @@ test('body-parser client errors keep their status instead of becoming 500', asyn
   assert.equal(oversized.status, 413)
   assert.equal((await oversized.json()).ok, false)
 })
+
+test('trust proxy is set so login rate limiting sees real client IPs', () => {
+  assert.equal(app.get('trust proxy'), 1)
+})

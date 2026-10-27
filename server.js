@@ -60,6 +60,9 @@ db.exec(`
 const USERNAME_RE = /^[a-zA-Z0-9_\u4e00-\u9fa5]{2,20}$/
 
 const app = express()
+// 只信任本机 Caddy 这一跳反代，否则 req.ip 对所有用户都是 127.0.0.1，
+// 登录限流会变成全站共享一个桶（任一来源打满即锁住所有人登录）。
+app.set('trust proxy', 1)
 app.use(cors()) // 前端在 GitHub Pages，允许跨域
 app.use(express.json({ limit: '5mb' })) // 学习数据 blob 上限 5MB
 
