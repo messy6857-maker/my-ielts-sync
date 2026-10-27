@@ -150,3 +150,22 @@ test('cron failures return a JSON error without leaking a stack', async () => {
   assert.equal(body.stack, undefined)
   db.prepare('UPDATE sync_data SET data=? WHERE user_id=1').run(row.data)
 })
+test('body-parser client errors keep their status instead of becoming 500', async () => {
+  const malformed = await fetch(base + '/api/sync', {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: '{not json',
+  })
+  assert.equal(malformed.status, 400)
+  assert.equal((await malformed.json()).ok, false)
+  const oversized = await fetch(base + '/api/sync', {
+    method: 'PUT',
+    headers: {
+      'Content-Type': 'application/json',
+      Authorization: 'Bearer ' + token,
+    },
+    body: JSON.stringify({ data: 'x'.repeat(6 * 1024 * 1024) }),
+  })
+  assert.equal(oversized.status, 413)
+  assert.equal((await oversized.json()).ok, false)
+})

@@ -318,10 +318,20 @@ app.post('/api/ai/chat', auth, async (req, res) => {
 })
 
 // Express also routes synchronous cron/SQLite failures here; clients always receive JSON.
+// body-parser 自带 status（畸形 JSON 400、超限 413）属于客户端问题，原样保留；
+// 只有真正的服务端异常才统一成 500，否则客户端问题会被误报成服务端故障。
 app.use((error, req, res, next) => {
   if (res.headersSent) return next(error)
+  const status = Number.isInteger(error.status) && error.status >= 400 && error.status < 500
+    ? error.status
+    : 500
   console.error('Request failed:', error.message)
-  res.status(500).json({ ok: false, message: '服务端读取数据失败，请稍后重试' })
+  res.status(status).json({
+    ok: false,
+    message: status === 500
+      ? '服务端读取数据失败，请稍后重试'
+      : error.message || '请求数据格式错误',
+  })
 })
 
 if (require.main === module) {
