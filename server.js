@@ -72,12 +72,10 @@ app.post('/api/register', authLimiter, async (req, res) => {
   const username = String(req.body?.username || '').trim()
   const password = String(req.body?.password || '')
   if (!USERNAME_RE.test(username))
-    return res
-      .status(400)
-      .json({
-        ok: false,
-        message: '用户名需为 2-20 位字母、数字、下划线或中文',
-      })
+    return res.status(400).json({
+      ok: false,
+      message: '用户名需为 2-20 位字母、数字、下划线或中文',
+    })
   if (password.length < 4)
     return res.status(400).json({ ok: false, message: '密码至少 4 位' })
   const exists = db
@@ -131,7 +129,7 @@ function auth(req, res, next) {
   }
 }
 
-// 拉取： whole blob
+// 拉取：返回按账号校验后的条目快照
 app.get('/api/sync', auth, (req, res) => {
   const row = db
     .prepare('SELECT data, updated_at FROM sync_data WHERE user_id = ?')
@@ -146,7 +144,7 @@ app.get('/api/sync', auth, (req, res) => {
   })
 })
 
-// 推送： whole blob 整体覆盖（last-write-wins）
+// 推送：协议 2 按独立条目版本合并，处理函数见下方 PUT /api/sync
 // 定时任务专用：获取某用户某天学过的单词 ID（只读，需 X-Cron-Token）
 // studiedAt 用 dueAt - interval 反推；date 为北京时间 YYYY-MM-DD
 // 定时任务专用：列出所有用户名（只读，需 X-Cron-Token），用于按账号生成每日阅读
@@ -317,6 +315,13 @@ app.post('/api/ai/chat', auth, async (req, res) => {
   } catch (e) {
     res.status(502).json({ ok: false, message: 'AI 接口请求失败' })
   }
+})
+
+// Express also routes synchronous cron/SQLite failures here; clients always receive JSON.
+app.use((error, req, res, next) => {
+  if (res.headersSent) return next(error)
+  console.error('Request failed:', error.message)
+  res.status(500).json({ ok: false, message: '服务端读取数据失败，请稍后重试' })
 })
 
 if (require.main === module) {

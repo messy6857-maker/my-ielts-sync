@@ -137,3 +137,16 @@ test('cron recognizes independently stored vocabulary schedules', async () => {
   )
   assert.deepEqual((await r.json()).words, ['vocab:12'])
 })
+test('cron failures return a JSON error without leaking a stack', async () => {
+  const row = db.prepare('SELECT data FROM sync_data WHERE user_id=1').get()
+  db.prepare('UPDATE sync_data SET data=? WHERE user_id=1').run('invalid JSON')
+  const response = await fetch(
+    base + '/api/cron/studied-words?username=alice&date=2026-10-27',
+    { headers: { 'X-Cron-Token': 'local-cron-test' } },
+  )
+  assert.equal(response.status, 500)
+  const body = await response.json()
+  assert.equal(body.ok, false)
+  assert.equal(body.stack, undefined)
+  db.prepare('UPDATE sync_data SET data=? WHERE user_id=1').run(row.data)
+})
