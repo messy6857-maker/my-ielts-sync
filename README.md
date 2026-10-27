@@ -40,3 +40,11 @@ sudo bash deploy/install.sh
 ## 前端对接
 
 前端 `src/sync-config.ts` 中的 `SYNC_API_BASE` 指向 `https://38-64-63-20.sslip.io/api` 即开启云同步；留空则回退到纯本地模式。
+
+## 同步协议 2 升级
+
+前端与本后端需要配套升级。PUT /api/sync 必须带 protocolVersion: 2；旧客户端写入返回 426，防止整包覆盖。新前端遇到旧服务时保留本机记录并停止上传，更新服务后可手动点击同步恢复。
+
+每个学习条目带版本 stamp，服务器在 SQLite BEGIN IMMEDIATE 事务中合并，删除也是版本化条目。首次升级写入前，原始整包保存在 sync_backups 表（每账号一份，不覆盖）。存量原始表仅在客户端确认迁移完成后移除；凭据、API Key 和草稿不进入同步白名单。
+
+部署时必须同时复制 server.js、sync-protocol.js、package.json、package-lock.json；安装脚本已包含这四个文件。Node 22.13+（建议 24），依赖用 npm ci 安装。运行 npm test 验证协议、HTTP 路由和真实内存 SQLite。此提交没有执行部署或改动 VPS。
