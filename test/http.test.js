@@ -73,27 +73,26 @@ test('merges independent device pushes instead of replacing the stored blob', as
   assert.equal(Object.keys(result.data).length, 2)
 })
 test('cross-account data is rejected without damaging either account', async () => {
-  assert.equal(
-    (
-      await request(
-        '/api/sync',
-        'PUT',
-        {
-          protocolVersion: 2,
-          data: { myielts_u_alice_progress_v1: envelope({}) },
-        },
-        tokenBob,
-      )
-    ).status,
-    400,
+  const r = await request(
+    '/api/sync',
+    'PUT',
+    {
+      protocolVersion: 2,
+      data: { myielts_u_alice_progress_v1: envelope({}) },
+    },
+    tokenBob,
   )
+  // Foreign keys are skipped and reported (no longer a whole-payload 400),
+  // but nothing is stored for bob and alice's data is untouched.
+  assert.equal(r.status, 200)
+  assert.deepEqual(r.rejected, ['myielts_u_alice_progress_v1'])
   assert.equal(
     (await request('/api/sync', 'GET', undefined, tokenBob)).data,
     null,
   )
   assert.equal(Object.keys((await request('/api/sync')).data).length, 2)
 })
-test('a failed merge rolls back every entry in its payload', async () => {
+test('a bad entry is skipped and reported while good entries still land', async () => {
   const r = await request('/api/sync', 'PUT', {
     protocolVersion: 2,
     data: {
@@ -101,8 +100,9 @@ test('a failed merge rolls back every entry in its payload', async () => {
       bad: 'invalid',
     },
   })
-  assert.equal(r.status, 400)
-  assert.equal(Object.keys((await request('/api/sync')).data).length, 2)
+  assert.equal(r.status, 200)
+  assert.deepEqual(r.rejected, ['bad'])
+  assert.equal(Object.keys((await request('/api/sync')).data).length, 3)
 })
 test('backs up pre-upgrade data once and retains that immutable copy', async () => {
   const row = db.prepare('SELECT data FROM sync_backups WHERE user_id=1').get()
@@ -168,6 +168,38 @@ test('body-parser client errors keep their status instead of becoming 500', asyn
   })
   assert.equal(oversized.status, 413)
   assert.equal((await oversized.json()).ok, false)
+})
+
+test('ai relay rejects non-allowlisted hosts before fetching upstream', async () => {
+  const r = await request('/api/ai/chat', 'POST', {
+    baseUrl: 'https://example.com/v1',
+    apiKey: 'x',
+    model: 'm',
+    messages: [{ role: 'user', content: 'hi' }],
+  })
+  assert.equal(r.status, 400)
+  assert.match(r.message, /允许列表/)
+})
+
+test('ai relay is rate limited per account', async () => {
+  // bob's bucket is untouched by the allowlist test above (alice's token);
+  // every call is rejected by the allowlist before any upstream fetch.
+  let last
+  for (let i = 0; i < 61; i++) {
+    last = await request(
+      '/api/ai/chat',
+      'POST',
+      {
+        baseUrl: 'https://example.com/v1',
+        apiKey: 'x',
+        model: 'm',
+        messages: [{ role: 'user', content: 'hi' }],
+      },
+      tokenBob,
+    )
+  }
+  assert.equal(last.status, 429)
+  assert.match(last.message, /频繁/)
 })
 
 test('trust proxy is set so login rate limiting sees real client IPs', () => {

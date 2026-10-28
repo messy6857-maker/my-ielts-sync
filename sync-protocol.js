@@ -82,10 +82,15 @@ const past = (key, e, c) =>
   (e.stamp[0] - c[0] ||
     e.stamp[1].localeCompare(c[1]) ||
     key.localeCompare(c[2])) <= 0
-function mergeData(previous, incoming, user) {
+function mergeDataWithReport(previous, incoming, user) {
   if (!incoming || typeof incoming !== 'object' || Array.isArray(incoming))
     throw new Error('Invalid data')
   const out = Object.create(null)
+  // Rejected incoming entries are skipped (not fatal): a single poisoned
+  // entry used to fail the whole PUT with 400, leaving the account stuck in
+  // pending forever with no way to identify the bad key. Good entries in
+  // the same payload still merge; previously stored entries are untouched.
+  const rejected = []
   for (const [key, raw] of Object.entries(previous || {}))
     if (baseOf(key, user) && typeof raw === 'string') {
       try {
@@ -95,9 +100,18 @@ function mergeData(previous, incoming, user) {
     }
   for (const [key, raw] of Object.entries(incoming)) {
     const base = baseOf(key, user)
-    if (!base || typeof raw !== 'string') throw new Error('Invalid account key')
-    const e = decode(raw),
-      old = out[key] === undefined ? null : decode(out[key])
+    if (!base || typeof raw !== 'string') {
+      rejected.push(key)
+      continue
+    }
+    let e
+    try {
+      e = decode(raw)
+    } catch {
+      rejected.push(key)
+      continue
+    }
+    const old = out[key] === undefined ? null : decode(out[key])
     if (
       base.startsWith('checkin_years_v2__entry_') &&
       !e.deleted &&
@@ -121,7 +135,13 @@ function mergeData(previous, incoming, user) {
   const marker = `myielts_u_${user}_archive_retention_v2`
   const cuts = [previous?.[marker], incoming[marker]]
     .filter(Boolean)
-    .map((x) => decode(x).value?.cutoff)
+    .map((x) => {
+      try {
+        return decode(x).value?.cutoff
+      } catch {
+        return undefined // a rejected marker entry must not poison the merge
+      }
+    })
     .filter((x) => Array.isArray(x) && x.length === 3)
   cuts.sort(
     (a, b) =>
@@ -198,6 +218,16 @@ function mergeData(previous, incoming, user) {
       if (new Date(date).getTime() < Date.now() - 90 * 86400000) delete out[key]
     }
   }
-  return out
+  return { data: out, rejected }
 }
-module.exports = { protocolVersion, baseOf, decode, compare, mergeData }
+function mergeData(previous, incoming, user) {
+  return mergeDataWithReport(previous, incoming, user).data
+}
+module.exports = {
+  protocolVersion,
+  baseOf,
+  decode,
+  compare,
+  mergeData,
+  mergeDataWithReport,
+}

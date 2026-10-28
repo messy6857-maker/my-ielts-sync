@@ -72,4 +72,4 @@ sleep 3
 
 echo ""
 echo "部署完成，检查健康状态："
-curl -sk https://38-64-63-20.sslip.io/api/health || echo "（证书申请中，稍等 1-2 分钟再试）"
+curl -sk https://104-233-149-98.sslip.io/api/health || echo "（证书申请中，稍等 1-2 分钟再试）"

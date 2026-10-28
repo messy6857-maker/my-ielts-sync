@@ -11,7 +11,12 @@ const cors = require('cors')
 const rateLimit = require('express-rate-limit')
 const bcrypt = require('bcryptjs')
 const jwt = require('jsonwebtoken')
-const { protocolVersion, mergeData, decode } = require('./sync-protocol')
+const {
+  protocolVersion,
+  mergeData,
+  mergeDataWithReport,
+  decode,
+} = require('./sync-protocol')
 
 const PORT = Number(process.env.PORT || 3001)
 const DATA_DIR = process.env.DATA_DIR || path.join(__dirname, 'data')
@@ -69,6 +74,22 @@ app.use(express.json({ limit: '5mb' })) // 学习数据 blob 上限 5MB
 // 登录/注册接口限流：防爆破
 const authLimiter = rateLimit({ windowMs: 15 * 60 * 1000, max: 60 })
 
+// AI 中转限流：按账号分桶（auth 在前，req.user 已就绪；不按 IP 分桶，
+// 避免反代后所有用户共用一个桶）。60 次/15 分钟远高于正常批改频率。
+const aiLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 60,
+  keyGenerator: (req) => `ai:${req.user?.uid ?? 'anon'}`,
+  handler: (req, res) =>
+    res
+      .status(429)
+      .json({ ok: false, message: 'AI 请求过于频繁，请稍后再试' }),
+})
+// AI 中转白名单：只允许代码里真实存在的默认 AI 端点 host。
+// 前端默认 baseUrl（useAISettings.ts）为 https://api-cdn.thehive.ai/api/v3；
+// 设置页 placeholder 的 deepseek 地址只是示例占位、并非默认值，不列入。
+const AI_ALLOWED_HOSTS = ['api-cdn.thehive.ai']
+
 app.get('/api/health', (req, res) => res.json({ ok: true, ts: Date.now() }))
 
 app.post('/api/register', authLimiter, async (req, res) => {
@@ -109,9 +130,10 @@ app.post('/api/login', authLimiter, async (req, res) => {
     .prepare('SELECT * FROM users WHERE username = ?')
     .get(username)
   if (!user)
-    return res.status(401).json({ ok: false, message: '用户不存在，请先注册' })
+    return res.status(401).json({ ok: false, message: '用户名或密码不正确' })
   const match = await bcrypt.compare(password, user.password_hash)
-  if (!match) return res.status(401).json({ ok: false, message: '密码不正确' })
+  if (!match)
+    return res.status(401).json({ ok: false, message: '用户名或密码不正确' })
   const token = jwt.sign({ uid: user.id, username }, JWT_SECRET, {
     expiresIn: '30d',
   })
@@ -248,6 +270,7 @@ app.put('/api/sync', auth, (req, res) => {
       .status(426)
       .json({ ok: false, message: '请更新客户端后再同步，服务器已保留原记录' })
   let data
+  let rejected = []
   try {
     // BEGIN IMMEDIATE protects read/merge/write even if several server workers share this DB.
     db.exec('BEGIN IMMEDIATE')
@@ -255,7 +278,9 @@ app.put('/api/sync', auth, (req, res) => {
       .prepare('SELECT data FROM sync_data WHERE user_id=?')
       .get(req.user.uid)
     const old = row ? JSON.parse(row.data) : {}
-    data = mergeData(old, req.body?.data, req.user.username)
+    const merged = mergeDataWithReport(old, req.body?.data, req.user.username)
+    data = merged.data
+    rejected = merged.rejected
     if (Buffer.byteLength(JSON.stringify(data)) > 5 * 1024 * 1024)
       throw new Error('同步数据超过 5MB，请先导出并整理记录')
     if (row)
@@ -263,11 +288,14 @@ app.put('/api/sync', auth, (req, res) => {
         'INSERT OR IGNORE INTO sync_backups(user_id,data,created_at) VALUES(?,?,?)',
       ).run(req.user.uid, row.data, Date.now())
     const now = Date.now()
-    db.prepare(
-      'INSERT INTO sync_data(user_id,data,updated_at) VALUES(?,?,?) ON CONFLICT(user_id) DO UPDATE SET data=excluded.data,updated_at=excluded.updated_at',
-    ).run(req.user.uid, JSON.stringify(data), now)
+    // A payload whose entries were all rejected must not create a phantom
+    // row: GET still reports data: null for an account that never synced.
+    if (row || Object.keys(data).length > 0)
+      db.prepare(
+        'INSERT INTO sync_data(user_id,data,updated_at) VALUES(?,?,?) ON CONFLICT(user_id) DO UPDATE SET data=excluded.data,updated_at=excluded.updated_at',
+      ).run(req.user.uid, JSON.stringify(data), now)
     db.exec('COMMIT')
-    res.json({ ok: true, protocolVersion, data, updatedAt: now })
+    res.json({ ok: true, protocolVersion, data, rejected, updatedAt: now })
   } catch (error) {
     try {
       db.exec('ROLLBACK')
@@ -280,14 +308,14 @@ app.put('/api/sync', auth, (req, res) => {
 
 // AI 中转：浏览器直连第三方 API 会被 CORS 拦截，走服务端转发
 // 所有登录账号可用，每人用自己的 API Key
-app.post('/api/ai/chat', auth, async (req, res) => {
+app.post('/api/ai/chat', auth, aiLimiter, async (req, res) => {
   // 所有登录账号可用，每人用自己的 API Key
   const { baseUrl, apiKey, model, messages, temperature } = req.body || {}
   if (!baseUrl || !apiKey || !model || !Array.isArray(messages))
     return res
       .status(400)
       .json({ ok: false, message: '缺少 baseUrl/apiKey/model/messages' })
-  // 只允许 https 地址
+  // 只允许 https 地址，且 host 必须在白名单内，否则 VPS 会被当作开放代理
   let url
   try {
     url = new URL(baseUrl.replace(/\/+$/, '') + '/chat/completions')
@@ -295,6 +323,8 @@ app.post('/api/ai/chat', auth, async (req, res) => {
   } catch {
     return res.status(400).json({ ok: false, message: 'API 地址不合法' })
   }
+  if (!AI_ALLOWED_HOSTS.includes(url.hostname))
+    return res.status(400).json({ ok: false, message: 'API 地址不在允许列表中' })
   try {
     const r = await fetch(url, {
       method: 'POST',
