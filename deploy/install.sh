@@ -62,10 +62,20 @@ echo "==> 4/5 配置 systemd 服务"
 cp "$SCRIPT_DIR/my-ielts-sync.service" /etc/systemd/system/
 systemctl daemon-reload
 systemctl enable --now my-ielts-sync
+# enable --now 对已运行服务是 no-op：重跑时必须显式 restart，新代码才真正生效
+systemctl restart my-ielts-sync
 sleep 2
 systemctl is-active --quiet my-ielts-sync && echo "sync server 运行中" || { echo "sync server 启动失败"; journalctl -u my-ielts-sync --no-pager -n 20; exit 1; }
+# 健康校验：服务须真正响应（本仓库 service 文件固定 PORT=3001、只绑 127.0.0.1）
+curl -fsS http://127.0.0.1:3001/api/health >/dev/null || { echo "sync server 健康检查失败"; journalctl -u my-ielts-sync --no-pager -n 20; exit 1; }
+echo "sync server 健康检查通过"
 
 echo "==> 5/5 配置 Caddy 反向代理 + 自动 HTTPS"
+# 先备份 VPS 现有 Caddyfile 再覆盖，避免抹掉仓库版之外的本地定制
+if [ -f /etc/caddy/Caddyfile ]; then
+  cp /etc/caddy/Caddyfile "/etc/caddy/Caddyfile.bak-$(date +%F-%H%M%S)"
+  echo "已备份旧 Caddyfile"
+fi
 cp "$SCRIPT_DIR/Caddyfile" /etc/caddy/Caddyfile
 systemctl reload caddy || systemctl restart caddy
 sleep 3
