@@ -16,7 +16,7 @@ test('username boundaries and credentials never synchronize', () => {
     { [key('unknown')]: value(1) },
     'alice',
   )
-  assert.deepEqual(rejected, [key('unknown')])
+  assert.deepEqual(rejected, [{ key: key('unknown'), reason: 'unknown-base' }])
   assert.equal(data[key('unknown')], undefined)
 })
 test('two independent writes preserve both records inside SQLite', () => {
@@ -67,7 +67,7 @@ test('malformed envelopes are skipped and reported, good entries still merge', (
     },
     'alice',
   )
-  assert.deepEqual(rejected, [bad])
+  assert.deepEqual(rejected, [{ key: bad, reason: 'decode-failed' }])
   assert.equal(data[bad], undefined)
   assert.equal(decode(data[good]).value.done, 1)
   // A previously stored good entry survives a later payload carrying a bad key.
@@ -76,8 +76,73 @@ test('malformed envelopes are skipped and reported, good entries still merge', (
     { [bad]: 'not json at all' },
     'alice',
   )
-  assert.deepEqual(again.rejected, [bad])
+  assert.deepEqual(again.rejected, [{ key: bad, reason: 'decode-failed' }])
   assert.equal(decode(again.data[good]).value.done, 1)
+})
+test('legacy seed keys merge by union/max instead of first-writer freeze', () => {
+  const enc = (id) =>
+    id
+      .split('')
+      .map((c) => c.charCodeAt(0).toString(16).padStart(4, '0'))
+      .join('')
+  const legacy = (v) => JSON.stringify({ __ielts: 2, stamp: [0, 'legacy'], value: v })
+  // stats: per-field max, neither device loses historical counts.
+  const statsKey = key('stats_parts_v2__entry_' + enc('legacy'))
+  const mergedStats = mergeData(
+    { [statsKey]: legacy({ totals: { vocabulary: { known: 3, vague: 0, unknown: 0 } }, days: {} }) },
+    { [statsKey]: legacy({ totals: { vocabulary: { known: 5, vague: 2, unknown: 0 } }, days: {} }) },
+    'alice',
+  )
+  assert.deepEqual(decode(mergedStats[statsKey]).value.totals, {
+    vocabulary: { known: 5, vague: 2, unknown: 0 },
+  })
+  assert.deepEqual(decode(mergedStats[statsKey]).stamp, [0, 'legacy'])
+  // mistake: count max, firstAt min, lastAt max.
+  const mistakeKey = key('mistake_parts_v2__entry_' + enc('vocabulary:apple|legacy'))
+  const mergedMistake = mergeData(
+    { [mistakeKey]: legacy({ count: 2, firstAt: 100, lastAt: 200 }) },
+    { [mistakeKey]: legacy({ count: 5, firstAt: 50, lastAt: 150 }) },
+    'alice',
+  )
+  assert.deepEqual(decode(mergedMistake[mistakeKey]).value, {
+    count: 5,
+    firstAt: 50,
+    lastAt: 200,
+  })
+  // daily: same date keeps the higher count; a later date wins outright.
+  // (Dates are relative to today: the merge trims daily entries older than
+  // 14 days, so fixed 2026-10-01 fixtures would be pruned, not merged.)
+  const fmtDay = (d) => d.toISOString().slice(0, 10)
+  const day1 = fmtDay(new Date(Date.now() - 86400000))
+  const day2 = fmtDay(new Date())
+  const dailyKey = key('daily_parts_v2__entry_' + enc(`vocabulary|${day1}|legacy`))
+  const mergedDaily = mergeData(
+    { [dailyKey]: legacy({ date: day1, count: 3 }) },
+    { [dailyKey]: legacy({ date: day1, count: 5 }) },
+    'alice',
+  )
+  assert.equal(decode(mergedDaily[dailyKey]).value.count, 5)
+  const laterDaily = mergeData(
+    { [dailyKey]: legacy({ date: day1, count: 9 }) },
+    { [dailyKey]: legacy({ date: day2, count: 1 }) },
+    'alice',
+  )
+  assert.equal(decode(laterDaily[dailyKey]).value.date, day2)
+  // Boundary: a stamp-0 entry that is NOT a legacy seed id keeps plain LWW
+  // (first writer wins on equal stamps); a versioned write beats a seed.
+  const plainKey = key('stats_parts_v2__entry_' + enc('plain'))
+  const plain = mergeData(
+    { [plainKey]: legacy({ totals: { vocabulary: { known: 1 } } }) },
+    { [plainKey]: legacy({ totals: { vocabulary: { known: 9 } } }) },
+    'alice',
+  )
+  assert.equal(decode(plain[plainKey]).value.totals.vocabulary.known, 1)
+  const versioned = mergeData(
+    { [statsKey]: legacy({ totals: { vocabulary: { known: 3 } }, days: {} }) },
+    { [statsKey]: value({ totals: { vocabulary: { known: 1 } }, days: {} }, 7) },
+    'alice',
+  )
+  assert.equal(decode(versioned[statsKey]).value.totals.vocabulary.known, 1)
 })
 test('concurrent yearly check-ins are unioned', () => {
   const k = key('checkin_years_v2__entry_0032003000320036')

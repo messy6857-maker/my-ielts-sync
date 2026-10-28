@@ -5,6 +5,7 @@
 const fs = require('fs')
 const path = require('path')
 const crypto = require('crypto')
+const dns = require('dns')
 const { DatabaseSync } = require('node:sqlite')
 const express = require('express')
 const cors = require('cors')
@@ -70,6 +71,11 @@ const app = express()
 app.set('trust proxy', 1)
 app.use(cors()) // 前端在 GitHub Pages，允许跨域
 app.use(express.json({ limit: '5mb' })) // 学习数据 blob 上限 5MB
+// 请求 id：只进服务端日志（排障用），不改客户端响应文案。
+app.use((req, _res, next) => {
+  req.requestId = crypto.randomUUID()
+  next()
+})
 
 // 登录/注册接口限流：防爆破
 const authLimiter = rateLimit({ windowMs: 15 * 60 * 1000, max: 60 })
@@ -85,10 +91,103 @@ const aiLimiter = rateLimit({
       .status(429)
       .json({ ok: false, message: 'AI 请求过于频繁，请稍后再试' }),
 })
+// 同步接口限流：按账号分桶，阈值宽松到正常同步与重试风暴之外
+// （登录拉取 + 8 秒防抖推送 + 可见性拉取远低于此；只挡循环 hammer）。
+// 上限可用 SYNC_RATE_LIMIT_MAX 覆盖（测试用），默认 600 次/15 分钟。
+const syncLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: Number(process.env.SYNC_RATE_LIMIT_MAX || 600),
+  keyGenerator: (req) => `sync:${req.user?.uid ?? 'anon'}`,
+  handler: (req, res) =>
+    res
+      .status(429)
+      .json({ ok: false, message: '同步请求过于频繁，请稍后再试' }),
+})
+// GET /api/sync 合并缓存（S-Opt-#7 无协议变更的安全子集）：同一账号的
+// 存储行只在 PUT 时变化，以 updated_at 为键缓存合并结果；PUT 后失效。
+// 增量 GET/PUT（仅回变化条目）需改动同步协议形状，本次不做。
+const syncGetCache = new Map()
+function cachedSyncGet(uid, updatedAt) {
+  const hit = syncGetCache.get(uid)
+  return hit && hit.updatedAt === updatedAt ? hit.data : null
+}
+function storeSyncGet(uid, updatedAt, data) {
+  if (syncGetCache.size >= 100) syncGetCache.clear()
+  syncGetCache.set(uid, { updatedAt, data })
+}
 // AI 中转白名单：只允许代码里真实存在的默认 AI 端点 host。
 // 前端默认 baseUrl（useAISettings.ts）为 https://api-cdn.thehive.ai/api/v3；
 // 设置页 placeholder 的 deepseek 地址只是示例占位、并非默认值，不列入。
 const AI_ALLOWED_HOSTS = ['api-cdn.thehive.ai']
+// 白名单 hostname 归一化：URL 解析保留尾点（api-cdn.thehive.ai.），
+// 校验前去掉尾点，避免合法地址被误拒；大小写已由 URL 解析自动小写。
+function normalizeAiHost(hostname) {
+  return String(hostname || '').replace(/\.$/, '')
+}
+// 纯函数：IP 是否落在私有/保留段。IPv4-mapped 的 IPv6 按内嵌 IPv4 判定。
+function isPrivateOrReservedIp(ip) {
+  if (typeof ip !== 'string') return false
+  const v = ip.toLowerCase().split('%')[0]
+  if (v.includes(':')) {
+    if (v === '::' || v === '::1') return true
+    if (v.startsWith('::ffff:')) {
+      const rest = v.slice(7)
+      if (rest.includes('.')) return isPrivateOrReservedIp(rest)
+      // ::ffff:0:0/96 的十六进制写法：取后 32 位还原为 IPv4
+      const groups = v.split(':').filter(Boolean)
+      if (groups.length >= 2) {
+        const hi = parseInt(groups[groups.length - 2], 16)
+        const lo = parseInt(groups[groups.length - 1], 16)
+        if (Number.isInteger(hi) && Number.isInteger(lo))
+          return isPrivateOrReservedIp(
+            `${hi >> 8}.${hi & 0xff}.${lo >> 8}.${lo & 0xff}`,
+          )
+      }
+      return false
+    }
+    const groups = expandIPv6(v)
+    if (!groups) return false
+    const [g0, g1] = groups
+    if (g0 === 0 && g1 === 0 && groups.slice(2).every((g) => g === 0)) return true // ::/128
+    if ((g0 & 0xffc0) === 0xfe80) return true // fe80::/10 链路本地
+    if ((g0 & 0xfe00) === 0xfc00) return true // fc00::/7 唯一本地
+    if ((g0 & 0xff00) === 0xff00) return true // ff00::/8 组播
+    if (g0 === 0x2001 && g1 === 0x0db8) return true // 2001:db8::/32 文档
+    return false
+  }
+  const parts = v.split('.')
+  if (parts.length !== 4) return false
+  const n = parts.map((p) => Number(p))
+  if (n.some((x) => !Number.isInteger(x) || x < 0 || x > 255)) return false
+  const [a, b, c] = n
+  if (a === 0 || a === 10 || a === 127) return true
+  if (a === 100 && b >= 64 && b <= 127) return true // 100.64/10 CGN
+  if (a === 169 && b === 254) return true
+  if (a === 172 && b >= 16 && b <= 31) return true
+  if (a === 192 && b === 0 && (c === 0 || c === 2)) return true // 192.0.0/24、192.0.2/24 TEST-NET-1
+  if (a === 192 && b === 168) return true
+  if (a === 198 && b === 18) return true // 198.18/15 基准测试
+  if (a === 198 && b === 51 && n[2] === 100) return true
+  if (a === 203 && b === 0 && n[2] === 113) return true
+  if (a >= 224) return true // 组播 + 240/4 保留
+  return false
+}
+function expandIPv6(v) {
+  const halves = v.split('::')
+  if (halves.length > 2) return null
+  const head = halves[0] ? halves[0].split(':') : []
+  const tail = halves.length === 2 && halves[1] ? halves[1].split(':') : []
+  if (head.length + tail.length > 8) return null
+  const groups = [
+    ...head,
+    ...Array(8 - head.length - tail.length).fill('0'),
+    ...tail,
+  ]
+  const nums = groups.map((g) => parseInt(g, 16))
+  return nums.some((x) => !Number.isInteger(x) || x < 0 || x > 0xffff)
+    ? null
+    : nums
+}
 
 app.get('/api/health', (req, res) => res.json({ ok: true, ts: Date.now() }))
 
@@ -155,16 +254,34 @@ function auth(req, res, next) {
 }
 
 // 拉取：返回按账号校验后的条目快照
-app.get('/api/sync', auth, (req, res) => {
+app.get('/api/sync', auth, syncLimiter, (req, res) => {
   const row = db
     .prepare('SELECT data, updated_at FROM sync_data WHERE user_id = ?')
     .get(req.user.uid)
   if (!row)
     return res.json({ ok: true, protocolVersion, data: null, updatedAt: 0 })
+  const cached = cachedSyncGet(req.user.uid, row.updated_at)
+  if (cached)
+    return res.json({
+      ok: true,
+      protocolVersion,
+      data: cached,
+      updatedAt: row.updated_at,
+    })
+  // 库里 blob 损坏（只能来自库外改动）时不再 500：回 data: null，
+  // 客户端下次推送覆盖自愈，而不是每次拉取都失败。
+  let stored
+  try {
+    stored = JSON.parse(row.data)
+  } catch {
+    return res.json({ ok: true, protocolVersion, data: null, updatedAt: row.updated_at })
+  }
+  const data = mergeData(stored, {}, req.user.username)
+  storeSyncGet(req.user.uid, row.updated_at, data)
   res.json({
     ok: true,
     protocolVersion,
-    data: mergeData(JSON.parse(row.data), {}, req.user.username),
+    data,
     updatedAt: row.updated_at,
   })
 })
@@ -216,7 +333,13 @@ app.get('/api/daily-reading', auth, (req, res) => {
     .prepare('SELECT data FROM daily_readings WHERE date = ? AND user_id = ?')
     .get(date, req.user.uid)
   if (!row) return res.json({ ok: true, date, reading: null })
-  res.json({ ok: true, date, reading: JSON.parse(row.data) })
+  let reading
+  try {
+    reading = JSON.parse(row.data)
+  } catch {
+    return res.json({ ok: true, date, reading: null })
+  }
+  res.json({ ok: true, date, reading })
 })
 app.get('/api/cron/studied-words', (req, res) => {
   const token = req.headers['x-cron-token']
@@ -235,7 +358,12 @@ app.get('/api/cron/studied-words', (req, res) => {
     .prepare('SELECT data FROM sync_data WHERE user_id = ?')
     .get(user.id)
   if (!row) return res.json({ ok: true, date, count: 0, words: [] })
-  const blob = JSON.parse(row.data)
+  let blob
+  try {
+    blob = JSON.parse(row.data)
+  } catch {
+    return res.json({ ok: true, date, count: 0, words: [] })
+  }
   const sched =
     decode(blob[`myielts_u_${username}_sr_vocabulary_v1`] || '{}').value || {}
   const prefix = `myielts_u_${username}_sr_vocabulary_v1__entry_`
@@ -264,7 +392,7 @@ app.get('/api/cron/studied-words', (req, res) => {
   res.json({ ok: true, date, count: words.length, words })
 })
 
-app.put('/api/sync', auth, (req, res) => {
+app.put('/api/sync', auth, syncLimiter, (req, res) => {
   if (req.body?.protocolVersion !== protocolVersion)
     return res
       .status(426)
@@ -277,7 +405,17 @@ app.put('/api/sync', auth, (req, res) => {
     const row = db
       .prepare('SELECT data FROM sync_data WHERE user_id=?')
       .get(req.user.uid)
-    const old = row ? JSON.parse(row.data) : {}
+    // 旧 blob 损坏时按空处理，让本次推送覆盖自愈（否则 GET 回 null 后
+    // 推送仍因旧 blob 解析失败而 400，自愈链路断掉）。损坏的旧 blob
+    // 仍按原逻辑进 sync_backups（INSERT OR IGNORE），不丢恢复线索。
+    let old = {}
+    if (row) {
+      try {
+        old = JSON.parse(row.data)
+      } catch {
+        old = {}
+      }
+    }
     const merged = mergeDataWithReport(old, req.body?.data, req.user.username)
     data = merged.data
     rejected = merged.rejected
@@ -295,6 +433,7 @@ app.put('/api/sync', auth, (req, res) => {
         'INSERT INTO sync_data(user_id,data,updated_at) VALUES(?,?,?) ON CONFLICT(user_id) DO UPDATE SET data=excluded.data,updated_at=excluded.updated_at',
       ).run(req.user.uid, JSON.stringify(data), now)
     db.exec('COMMIT')
+    syncGetCache.delete(req.user.uid)
     res.json({ ok: true, protocolVersion, data, rejected, updatedAt: now })
   } catch (error) {
     try {
@@ -323,8 +462,28 @@ app.post('/api/ai/chat', auth, aiLimiter, async (req, res) => {
   } catch {
     return res.status(400).json({ ok: false, message: 'API 地址不合法' })
   }
-  if (!AI_ALLOWED_HOSTS.includes(url.hostname))
+  if (!AI_ALLOWED_HOSTS.includes(normalizeAiHost(url.hostname)))
     return res.status(400).json({ ok: false, message: 'API 地址不在允许列表中' })
+  // SSRF 纵深：白名单 host 若被 DNS 劫持/重绑定到内网地址，fetch 前拦截。
+  // 仅当解析结果明确落在私有/保留段时拒绝；DNS 解析失败不拦截，
+  // 交给上游 fetch 自然报错（避免解析抖动误杀正常请求）。
+  let resolved = null
+  try {
+    resolved = await dns.promises.lookup(normalizeAiHost(url.hostname), {
+      all: true,
+    })
+  }
+  catch {
+    resolved = null
+  }
+  if (
+    resolved
+    && resolved.some(entry => isPrivateOrReservedIp(entry.address))
+  ) {
+    return res
+      .status(400)
+      .json({ ok: false, message: 'API 地址解析到内网地址，已拒绝' })
+  }
   try {
     const r = await fetch(url, {
       method: 'POST',
@@ -358,7 +517,7 @@ app.use((error, req, res, next) => {
   const status = Number.isInteger(error.status) && error.status >= 400 && error.status < 500
     ? error.status
     : 500
-  console.error('Request failed:', error.message)
+  console.error('Request failed:', req.requestId, error.stack || error.message)
   res.status(status).json({
     ok: false,
     message: status === 500
@@ -372,4 +531,4 @@ if (require.main === module) {
     console.log(`my-ielts sync server listening on 127.0.0.1:${PORT}`),
   )
 }
-module.exports = { app, db }
+module.exports = { app, db, normalizeAiHost, isPrivateOrReservedIp }

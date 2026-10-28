@@ -76,6 +76,72 @@ function decode(raw) {
 }
 const compare = (a, b) =>
   a.stamp[0] - b.stamp[0] || a.stamp[1].localeCompare(b.stamp[1])
+// legacy 种子键的服务端 union/max 合并（与客户端 legacyMerge 对齐）：
+// stats/mistake/daily 的种子条目（id 为 'legacy' 或以 '|legacy' 结尾）
+// 戳恒为 [0, 'legacy']，纯 LWW 下先写者冻结、永不收敛；此处按值合并，
+// 戳仍写回 [0, 'legacy']，后续推送继续合并直至收敛。不要删 legacy 键。
+function legacySeedId(base) {
+  const parts = base.split('__entry_')
+  if (parts.length !== 2 || !/^(?:[a-f\d]{4})+$/i.test(parts[1])) return null
+  const id = parts[1]
+    .match(/.{4}/g)
+    .map((x) => String.fromCharCode(parseInt(x, 16)))
+    .join('')
+  return id === 'legacy' || id.endsWith('|legacy') ? id : null
+}
+function dateMs(value) {
+  const d = new Date(value).getTime()
+  return Number.isNaN(d) ? Number.NaN : d
+}
+function mergeLegacyValue(table, a, b) {
+  if (a === undefined || a === null) return b
+  if (b === undefined || b === null) return a
+  if (table === 'mistake_parts_v2') {
+    return {
+      ...a,
+      ...b,
+      count: Math.max(a.count || 0, b.count || 0),
+      firstAt: Math.min(
+        a.firstAt ?? Number.POSITIVE_INFINITY,
+        b.firstAt ?? Number.POSITIVE_INFINITY,
+      ),
+      lastAt: Math.max(a.lastAt || 0, b.lastAt || 0),
+    }
+  }
+  if (table === 'stats_parts_v2') {
+    const result = JSON.parse(JSON.stringify(a))
+    result.totals = result.totals || {}
+    for (const [ns, count] of Object.entries(b.totals || {})) {
+      const old = (result.totals[ns] = result.totals[ns] || {})
+      for (const field of ['known', 'vague', 'unknown'])
+        old[field] = Math.max(
+          Number(old[field]) || 0,
+          Number(count?.[field]) || 0,
+        )
+    }
+    result.days = result.days || {}
+    for (const [date, modules] of Object.entries(b.days || {})) {
+      for (const [ns, count] of Object.entries(modules || {})) {
+        const old = ((result.days[date] = result.days[date] || {})[ns] =
+          result.days[date][ns] || {})
+        for (const field of ['known', 'vague', 'unknown'])
+          old[field] = Math.max(
+            Number(old[field]) || 0,
+            Number(count?.[field]) || 0,
+          )
+      }
+    }
+    return result
+  }
+  if (table === 'daily_parts_v2') {
+    const at = dateMs(a.date),
+      bt = dateMs(b.date)
+    if (at > bt) return a
+    if (at < bt) return b
+    return a.count > b.count ? a : b
+  }
+  return a
+}
 const archive = (base) => /^aigrade_(?:speaking_)?v1_/.test(base)
 const past = (key, e, c) =>
   c &&
@@ -100,15 +166,19 @@ function mergeDataWithReport(previous, incoming, user) {
     }
   for (const [key, raw] of Object.entries(incoming)) {
     const base = baseOf(key, user)
-    if (!base || typeof raw !== 'string') {
-      rejected.push(key)
+    if (!base) {
+      rejected.push({ key, reason: 'unknown-base' })
+      continue
+    }
+    if (typeof raw !== 'string') {
+      rejected.push({ key, reason: 'non-string' })
       continue
     }
     let e
     try {
       e = decode(raw)
     } catch {
-      rejected.push(key)
+      rejected.push({ key, reason: 'decode-failed' })
       continue
     }
     const old = out[key] === undefined ? null : decode(out[key])
@@ -128,6 +198,23 @@ function mergeDataWithReport(previous, incoming, user) {
       out[key] = JSON.stringify({
         ...(!old || compare(e, old) > 0 ? e : old),
         value: days,
+      })
+    } else if (
+      ['stats_parts_v2', 'mistake_parts_v2', 'daily_parts_v2'].includes(
+        base.split('__entry_')[0],
+      ) &&
+      legacySeedId(base) &&
+      old &&
+      !old.deleted &&
+      !e.deleted &&
+      old.stamp[0] === 0 &&
+      e.stamp[0] === 0
+    ) {
+      // 两设备 legacy 种子键：按值 union/max 合并，戳保持 [0, 'legacy']。
+      out[key] = JSON.stringify({
+        __ielts: 2,
+        stamp: [0, 'legacy'],
+        value: mergeLegacyValue(base.split('__entry_')[0], old.value, e.value),
       })
     } else if (!old || compare(e, old) > 0) out[key] = JSON.stringify(e)
   }

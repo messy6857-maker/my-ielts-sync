@@ -66,8 +66,10 @@ systemctl enable --now my-ielts-sync
 systemctl restart my-ielts-sync
 sleep 2
 systemctl is-active --quiet my-ielts-sync && echo "sync server 运行中" || { echo "sync server 启动失败"; journalctl -u my-ielts-sync --no-pager -n 20; exit 1; }
-# 健康校验：服务须真正响应（本仓库 service 文件固定 PORT=3001、只绑 127.0.0.1）
-curl -fsS http://127.0.0.1:3001/api/health >/dev/null || { echo "sync server 健康检查失败"; journalctl -u my-ielts-sync --no-pager -n 20; exit 1; }
+# 健康校验：服务须真正响应（service 文件默认 PORT=3001、只绑 127.0.0.1；
+# 若改过 service 的 Environment=PORT，跑脚本时用同一 PORT=... 前缀传入）
+HEALTH_PORT="${PORT:-3001}"
+curl -fsS "http://127.0.0.1:${HEALTH_PORT}/api/health" >/dev/null || { echo "sync server 健康检查失败"; journalctl -u my-ielts-sync --no-pager -n 20; exit 1; }
 echo "sync server 健康检查通过"
 
 echo "==> 5/5 配置 Caddy 反向代理 + 自动 HTTPS"
