@@ -282,3 +282,59 @@ test('a non-string incoming value is rejected with its own reason', async () => 
     { key: 'myielts_u_alice_progress_v1', reason: 'non-string' },
   ])
 })
+
+test('cron skips one corrupted independent schedule instead of failing the endpoint', async () => {
+  const uid = db.prepare('SELECT id FROM users WHERE username=?').get('alice').id
+  const row = db.prepare('SELECT data FROM sync_data WHERE user_id=?').get(uid)
+  const original = row.data
+  const data = JSON.parse(original)
+  data.myielts_u_alice_sr_vocabulary_v1__entry_0070006f00690073006f006e = '{broken-json'
+  db.prepare('UPDATE sync_data SET data=? WHERE user_id=?').run(JSON.stringify(data),uid)
+  try {
+    const r = await fetch(base+'/api/cron/studied-words?username=alice&date=2026-10-31',{headers:{'X-Cron-Token':'local-cron-test'}})
+    assert.equal(r.status,200)
+    assert.equal((await r.json()).ok,true)
+  } finally {db.prepare('UPDATE sync_data SET data=? WHERE user_id=?').run(original,uid)}
+})
+test('identical PUT leaves the persisted update version unchanged', async () => {
+  const data = (await request('/api/sync')).data
+  const uid = db.prepare('SELECT id FROM users WHERE username=?').get('alice').id
+  const before = db.prepare('SELECT updated_at FROM sync_data WHERE user_id=?').get(uid).updated_at
+  const result = await request('/api/sync','PUT',{protocolVersion:2,data})
+  assert.equal(result.ok,true)
+  assert.equal(result.updatedAt,before)
+  assert.equal(db.prepare('SELECT updated_at FROM sync_data WHERE user_id=?').get(uid).updated_at,before)
+})
+test('AI relay refuses redirection rather than following a second unvalidated host', async () => {
+  const relayToken = (await request('/api/register','POST',{username:'relay_redirect',password:'local-test-only'},null)).token
+  const originalFetch = global.fetch
+  const dns = require('node:dns')
+  const originalLookup = dns.promises.lookup
+  dns.promises.lookup = async () => [{address:'8.8.8.8',family:4}]
+  let upstream = false
+  global.fetch = async (url,init) => {
+    if (String(url).startsWith(base)) return originalFetch(url,init)
+    upstream = true
+    assert.equal(init.redirect,'error')
+    throw new Error('redirect rejected in local fixture')
+  }
+  try {
+    const result = await request('/api/ai/chat','POST',{baseUrl:'https://api-cdn.thehive.ai/api/v3',apiKey:'local-test-only',model:'test',messages:[]},relayToken)
+    assert.equal(result.ok,false)
+    assert.equal(upstream,true)
+  } finally {global.fetch=originalFetch;dns.promises.lookup=originalLookup}
+})
+test('GET cache expires without requiring a PUT on the following day', async () => {
+  const bearer = (await request('/api/register','POST',{username:'cache_day',password:'local-test-only'},null)).token
+  const now = Date.now()
+  const date = new Date(now-13*86400000).toISOString().slice(0,10)
+  const id = `vocabulary|${date}|word|device`
+  const hex = [...id].map(c=>c.charCodeAt(0).toString(16).padStart(4,'0')).join('')
+  const key = `myielts_u_cache_day_daily_parts_v2__entry_${hex}`
+  await request('/api/sync','PUT',{protocolVersion:2,data:{[key]:envelope({date,count:1})}},bearer)
+  assert.ok((await request('/api/sync','GET',undefined,bearer)).data[key])
+  const original = Date.now
+  Date.now = () => now+2*86400000
+  try {assert.equal((await request('/api/sync','GET',undefined,bearer)).data[key],undefined)}
+  finally {Date.now=original}
+})

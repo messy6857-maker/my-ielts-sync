@@ -6,6 +6,8 @@ set -euo pipefail
 APP_DIR=/opt/my-ielts-sync
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 SRC_DIR="$(dirname "$SCRIPT_DIR")"
+SYNC_PORT="${PORT:-3001}"
+[[ "$SYNC_PORT" =~ ^[0-9]+$ ]] && (( SYNC_PORT >= 1 && SYNC_PORT <= 65535 )) || { echo "PORT 必须为 1–65535"; exit 1; }
 
 echo "==> 1/5 安装 Node.js 22"
 NEED_NODE=0
@@ -45,7 +47,7 @@ caddy version
 
 echo "==> 3/5 部署应用到 $APP_DIR"
 mkdir -p "$APP_DIR/data"
-cp "$SRC_DIR/server.js" "$SRC_DIR/sync-protocol.js" "$SRC_DIR/package.json" "$SRC_DIR/package-lock.json" "$APP_DIR/"
+cp "$SRC_DIR/server.js" "$SRC_DIR/sync-protocol.js" "$SRC_DIR/retention.js" "$SRC_DIR/package.json" "$SRC_DIR/package-lock.json" "$APP_DIR/"
 cd "$APP_DIR"
 # 仅安装纯 JS 依赖（无 native 模块）；如已有 node_modules 则先清理，避免残留 better-sqlite3
 rm -rf node_modules/better-sqlite3
@@ -58,7 +60,23 @@ db.exec('CREATE TABLE t(a)');
 console.log('node:sqlite OK');
 "
 
+CONFIG_BACKUP_DIR=$(mktemp -d)
+[ ! -f /etc/my-ielts-sync.env ] || cp /etc/my-ielts-sync.env "$CONFIG_BACKUP_DIR/env"
+[ ! -f /etc/systemd/system/my-ielts-sync.service ] || cp /etc/systemd/system/my-ielts-sync.service "$CONFIG_BACKUP_DIR/service"
+APP_WAS_ACTIVE=0
+if systemctl is-active --quiet my-ielts-sync; then APP_WAS_ACTIVE=1; fi
+CADDY_CANDIDATE=$(mktemp)
+trap 'rm -f "$CADDY_CANDIDATE"; rm -rf "$CONFIG_BACKUP_DIR"' EXIT
+sed "s/__SYNC_PORT__/$SYNC_PORT/g" "$SCRIPT_DIR/Caddyfile" > "$CADDY_CANDIDATE"
+caddy validate --config "$CADDY_CANDIDATE" --adapter caddyfile
+
 echo "==> 4/5 配置 systemd 服务"
+ENV_CANDIDATE="$CONFIG_BACKUP_DIR/new-env"
+if [ -f /etc/my-ielts-sync.env ]; then
+  sed '/^[[:space:]]*PORT=/d' /etc/my-ielts-sync.env > "$ENV_CANDIDATE"
+fi
+printf '\nPORT=%s\n' "$SYNC_PORT" >> "$ENV_CANDIDATE"
+install -m 600 "$ENV_CANDIDATE" /etc/my-ielts-sync.env
 cp "$SCRIPT_DIR/my-ielts-sync.service" /etc/systemd/system/
 systemctl daemon-reload
 systemctl enable --now my-ielts-sync
@@ -68,18 +86,27 @@ sleep 2
 systemctl is-active --quiet my-ielts-sync && echo "sync server 运行中" || { echo "sync server 启动失败"; journalctl -u my-ielts-sync --no-pager -n 20; exit 1; }
 # 健康校验：服务须真正响应（service 文件默认 PORT=3001、只绑 127.0.0.1；
 # 若改过 service 的 Environment=PORT，跑脚本时用同一 PORT=... 前缀传入）
-HEALTH_PORT="${PORT:-3001}"
+HEALTH_PORT="$SYNC_PORT"
 curl -fsS "http://127.0.0.1:${HEALTH_PORT}/api/health" >/dev/null || { echo "sync server 健康检查失败"; journalctl -u my-ielts-sync --no-pager -n 20; exit 1; }
 echo "sync server 健康检查通过"
 
 echo "==> 5/5 配置 Caddy 反向代理 + 自动 HTTPS"
 # 先备份 VPS 现有 Caddyfile 再覆盖，避免抹掉仓库版之外的本地定制
-if [ -f /etc/caddy/Caddyfile ]; then
-  cp /etc/caddy/Caddyfile "/etc/caddy/Caddyfile.bak-$(date +%F-%H%M%S)"
-  echo "已备份旧 Caddyfile"
+CADDY_BACKUP="/etc/caddy/Caddyfile.bak-$(date +%F-%H%M%S)"
+if [ -f /etc/caddy/Caddyfile ]; then cp /etc/caddy/Caddyfile "$CADDY_BACKUP"; fi
+cp "$CADDY_CANDIDATE" /etc/caddy/Caddyfile
+if ! systemctl reload caddy; then
+  if [ -f "$CONFIG_BACKUP_DIR/env" ]; then
+    cp "$CONFIG_BACKUP_DIR/env" /etc/my-ielts-sync.env
+  else rm -f /etc/my-ielts-sync.env; fi
+  if [ -f "$CONFIG_BACKUP_DIR/service" ]; then
+    cp "$CONFIG_BACKUP_DIR/service" /etc/systemd/system/my-ielts-sync.service
+  else rm -f /etc/systemd/system/my-ielts-sync.service; fi
+  systemctl daemon-reload
+  if [ "$APP_WAS_ACTIVE" = 1 ]; then systemctl restart my-ielts-sync; else systemctl stop my-ielts-sync; fi
+  if [ -f "$CADDY_BACKUP" ]; then cp "$CADDY_BACKUP" /etc/caddy/Caddyfile; systemctl reload caddy; fi
+  echo "Caddy 重载失败，已尝试恢复原配置"; exit 1
 fi
-cp "$SCRIPT_DIR/Caddyfile" /etc/caddy/Caddyfile
-systemctl reload caddy || systemctl restart caddy
 sleep 3
 
 echo ""

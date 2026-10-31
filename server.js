@@ -109,11 +109,18 @@ const syncLimiter = rateLimit({
 const syncGetCache = new Map()
 function cachedSyncGet(uid, updatedAt) {
   const hit = syncGetCache.get(uid)
-  return hit && hit.updatedAt === updatedAt ? hit.data : null
+  if (!hit || hit.updatedAt !== updatedAt || Date.now() - hit.at > 60000) {
+    syncGetCache.delete(uid)
+    return null
+  }
+  syncGetCache.delete(uid)
+  syncGetCache.set(uid, hit)
+  return hit.data
 }
 function storeSyncGet(uid, updatedAt, data) {
-  if (syncGetCache.size >= 100) syncGetCache.clear()
-  syncGetCache.set(uid, { updatedAt, data })
+  syncGetCache.delete(uid)
+  if (syncGetCache.size >= 100) syncGetCache.delete(syncGetCache.keys().next().value)
+  syncGetCache.set(uid, { updatedAt, data, at: Date.now() })
 }
 // AI 中转白名单：只允许代码里真实存在的默认 AI 端点 host。
 // 前端默认 baseUrl（useAISettings.ts）为 https://api-cdn.thehive.ai/api/v3；
@@ -145,8 +152,20 @@ function isPrivateOrReservedIp(ip) {
       }
       return false
     }
-    const groups = expandIPv6(v)
+    let normalized = v
+    if (v.includes('.')) {
+      const offset = v.lastIndexOf(':')
+      const tail = v.slice(offset+1).split('.').map(Number)
+      if (tail.length === 4 && tail.every(n=>Number.isInteger(n) && n>=0 && n<=255))
+        normalized = v.slice(0,offset+1)+((tail[0]<<8)|tail[1]).toString(16)+':'+((tail[2]<<8)|tail[3]).toString(16)
+    }
+    const groups = expandIPv6(normalized)
     if (!groups) return false
+    if (groups.slice(0, 5).every(g => g === 0) && groups[5] === 0xffff)
+      return isPrivateOrReservedIp(`${groups[6] >> 8}.${groups[6] & 255}.${groups[7] >> 8}.${groups[7] & 255}`)
+    // RFC 6052 well-known NAT64 prefix: apply IPv4 filtering to its embedded address.
+    if (groups[0] === 0x64 && groups[1] === 0xff9b && groups.slice(2, 6).every(g => g === 0))
+      return isPrivateOrReservedIp(`${groups[6] >> 8}.${groups[6] & 255}.${groups[7] >> 8}.${groups[7] & 255}`)
     const [g0, g1] = groups
     if (g0 === 0 && g1 === 0 && groups.slice(2).every((g) => g === 0)) return true // ::/128
     if ((g0 & 0xffc0) === 0xfe80) return true // fe80::/10 链路本地
@@ -364,13 +383,16 @@ app.get('/api/cron/studied-words', (req, res) => {
   } catch {
     return res.json({ ok: true, date, count: 0, words: [] })
   }
-  const sched =
-    decode(blob[`myielts_u_${username}_sr_vocabulary_v1`] || '{}').value || {}
+  let sched = {}
+  try { sched = decode(blob[`myielts_u_${username}_sr_vocabulary_v1`] || '{}').value || {} }
+  catch { console.warn('studied-words: invalid legacy schedule', req.requestId) }
   const prefix = `myielts_u_${username}_sr_vocabulary_v1__entry_`
   for (const [key, raw] of Object.entries(blob)) {
     if (!key.startsWith(prefix)) continue
-    const e = decode(raw),
-      id = key
+    let e
+    try { e = decode(raw) }
+    catch { console.warn('studied-words: invalid entry', req.requestId); continue }
+    const id = key
         .slice(prefix.length)
         .match(/.{4}/g)
         ?.map((x) => String.fromCharCode(parseInt(x, 16)))
@@ -403,7 +425,7 @@ app.put('/api/sync', auth, syncLimiter, (req, res) => {
     // BEGIN IMMEDIATE protects read/merge/write even if several server workers share this DB.
     db.exec('BEGIN IMMEDIATE')
     const row = db
-      .prepare('SELECT data FROM sync_data WHERE user_id=?')
+      .prepare('SELECT data,updated_at FROM sync_data WHERE user_id=?')
       .get(req.user.uid)
     // 旧 blob 损坏时按空处理，让本次推送覆盖自愈（否则 GET 回 null 后
     // 推送仍因旧 blob 解析失败而 400，自愈链路断掉）。损坏的旧 blob
@@ -421,20 +443,21 @@ app.put('/api/sync', auth, syncLimiter, (req, res) => {
     rejected = merged.rejected
     if (Buffer.byteLength(JSON.stringify(data)) > 5 * 1024 * 1024)
       throw new Error('同步数据超过 5MB，请先导出并整理记录')
-    if (row)
+    const changed = !row || JSON.stringify(data) !== row.data
+    if (row && changed)
       db.prepare(
         'INSERT OR IGNORE INTO sync_backups(user_id,data,created_at) VALUES(?,?,?)',
       ).run(req.user.uid, row.data, Date.now())
     const now = Date.now()
     // A payload whose entries were all rejected must not create a phantom
     // row: GET still reports data: null for an account that never synced.
-    if (row || Object.keys(data).length > 0)
+    if (changed && (row || Object.keys(data).length > 0))
       db.prepare(
         'INSERT INTO sync_data(user_id,data,updated_at) VALUES(?,?,?) ON CONFLICT(user_id) DO UPDATE SET data=excluded.data,updated_at=excluded.updated_at',
       ).run(req.user.uid, JSON.stringify(data), now)
     db.exec('COMMIT')
-    syncGetCache.delete(req.user.uid)
-    res.json({ ok: true, protocolVersion, data, rejected, updatedAt: now })
+    if (changed) syncGetCache.delete(req.user.uid)
+    res.json({ ok: true, protocolVersion, data, rejected, updatedAt: changed ? now : row.updated_at })
   } catch (error) {
     try {
       db.exec('ROLLBACK')
@@ -487,6 +510,7 @@ app.post('/api/ai/chat', auth, aiLimiter, async (req, res) => {
   try {
     const r = await fetch(url, {
       method: 'POST',
+      redirect: 'error',
       headers: {
         'Content-Type': 'application/json',
         Authorization: 'Bearer ' + apiKey,

@@ -1,6 +1,8 @@
 'use strict'
+const { pruneCollectionData } = require('./retention')
 const mapBases = [
   'progress_v1',
+  'vocabulary_spell_v2',
   'sr_vocabulary_v1',
   'listening179_sr_v1',
   'reading538_sr_v1',
@@ -28,9 +30,11 @@ const scalarBases = [
   'stats_archive_v2',
   'checkin_archive_v2',
   'archive_retention_v2',
+  'collection_retention_v3',
   'migration_version_v2',
 ]
 const legacyBases = [
+  'vocabulary_spell_v1',
   'mistakes_v1',
   'flashcard_daily_new_v1',
   'listening179_daily_new_v1',
@@ -262,6 +266,17 @@ function mergeDataWithReport(previous, incoming, user) {
         value: { cutoff },
       })
   }
+  const retentionKey = `myielts_u_${user}_collection_retention_v3`
+  const retainedCuts = {}
+  for (const raw of [previous?.[retentionKey], incoming[retentionKey]]) {
+    try { for (const [base, cut] of Object.entries(decode(raw).value || {}))
+      if (typeof cut === 'string' && cut > (retainedCuts[base] || '')) retainedCuts[base] = cut
+    } catch {}
+  }
+  if (Object.keys(retainedCuts).length) {
+    const e = out[retentionKey] ? decode(out[retentionKey]) : {__ielts:2,stamp:[0,'legacy']}
+    out[retentionKey] = JSON.stringify({...e,value:retainedCuts})
+  }
   const migration = out[`myielts_u_${user}_migration_version_v2`]
   if (migration && decode(migration).value === 2) {
     // The transaction stores the pre-upgrade blob in sync_backups before dropping legacy tables.
@@ -305,7 +320,7 @@ function mergeDataWithReport(previous, incoming, user) {
       if (new Date(date).getTime() < Date.now() - 90 * 86400000) delete out[key]
     }
   }
-  return { data: out, rejected }
+  return { data: pruneCollectionData(out, user), rejected }
 }
 function mergeData(previous, incoming, user) {
   return mergeDataWithReport(previous, incoming, user).data
