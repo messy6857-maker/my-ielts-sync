@@ -117,4 +117,7 @@ sleep 3
 
 echo ""
 echo "部署完成，检查健康状态："
-curl -fsS --retry 10 --retry-delay 5 https://104-233-149-98.sslip.io/api/health || { echo "HTTPS 健康检查失败，请检查证书和 Caddy 日志"; exit 1; }
+if ! curl -fsS --retry 10 --retry-delay 5 --retry-all-errors https://104-233-149-98.sslip.io/api/health; then
+  echo "应用已启动且本机健康检查通过，但 HTTPS 部署验证尚未通过；可能仍在签发证书，请检查 Caddy 日志并单独重试 HTTPS 健康检查，无需重新安装。"
+  exit 2
+fi

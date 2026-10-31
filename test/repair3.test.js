@@ -181,3 +181,12 @@ test("legacy clients see spelling strings while modern clients retain conflictin
     "colour",
   ]);
 });
+
+test("capability-only sync GET reports current formats without returning account data", async () => {
+  const result = await request("/sync?capabilities=1");
+  assert.equal(result.status, 200);
+  assert.equal(result.protocolVersion, 2);
+  assert.equal(result.compactStats, true);
+  assert.equal(result.compactDeletes, true);
+  assert.equal(result.data, null);
+});

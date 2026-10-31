@@ -377,6 +377,15 @@ function syncView(req, data, updatedAt) {
   };
 }
 app.get("/api/sync", auth, syncLimiter, (req, res) => {
+  if (req.query.capabilities === "1")
+    return res.json({
+      ok: true,
+      protocolVersion,
+      compactStats: true,
+      compactDeletes: true,
+      data: null,
+      updatedAt: 0,
+    });
   const row = db
     .prepare("SELECT data,updated_at FROM sync_data WHERE user_id=?")
     .get(req.user.uid);

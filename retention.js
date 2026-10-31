@@ -22,6 +22,11 @@ function historyIdentity(id) {
       : Number.NaN;
   return Number.isFinite(ms) ? `${String(ms).padStart(16, "0")}:${id}` : null;
 }
+function collectionIdentity(id, stamp) {
+  return (
+    historyIdentity(id) || `${String(stamp?.[0] || 0).padStart(16, "0")}:${id}`
+  );
+}
 function pruneCollectionData(input, user, now = Date.now()) {
   const out = { ...input };
   const prefix = user ? `myielts_u_${user}_` : "myielts_";
@@ -48,9 +53,10 @@ function pruneCollectionData(input, user, now = Date.now()) {
       .filter((k) => k.startsWith(`${prefix}${base}__entry_`))
       .map((key) => ({
         key,
-        id:
-          historyIdentity(decodeId(key.split("__entry_")[1])) ||
-          `${String(parse(out[key])?.stamp?.[0] || 0).padStart(16, "0")}:${decodeId(key.split("__entry_")[1])}`,
+        id: collectionIdentity(
+          decodeId(key.split("__entry_")[1]),
+          parse(out[key])?.stamp,
+        ),
         e: parse(out[key]),
       }))
       .filter((x) => x.id && x.e)
@@ -149,7 +155,7 @@ function deletedTarget(key, user) {
 }
 function mergeDeletionEntries(a = {}, b = {}) {
   const out = Object.create(null);
-  for (const source of [a, b])
+  for (const source of [a, b]) {
     for (const [target, stamp] of Object.entries(source || {})) {
       if (
         !target.includes("|") ||
@@ -167,12 +173,13 @@ function mergeDeletionEntries(a = {}, b = {}) {
       )
         out[target] = stamp;
     }
+  }
   return out;
 }
-function expiredDeletionTarget(target, cuts, now) {
-  const split = target.indexOf("|"),
-    base = target.slice(0, split),
-    id = target.slice(split + 1);
+function expiredDeletionTarget(target, cuts, now, stamp) {
+  const split = target.indexOf("|");
+  const base = target.slice(0, split);
+  const id = target.slice(split + 1);
   const keep = [
     "daily_parts_v2",
     "daily_resets_v2",
@@ -190,44 +197,47 @@ function expiredDeletionTarget(target, cuts, now) {
     )
       return true;
   }
-  const identity = historyIdentity(id);
+  const identity = collectionIdentity(id, stamp);
   return !!identity && typeof cuts[base] === "string" && identity <= cuts[base];
 }
 function compactDeletionData(input, user, fold = true, now = Date.now()) {
-  const out = { ...input },
-    buckets = new Map();
+  const out = { ...input };
+  const buckets = new Map();
   const prefix = user ? `myielts_u_${user}_` : "myielts_";
   let cuts = {};
   try {
     cuts =
-      JSON.parse(out[prefix + "collection_retention_v3"] || "null")?.value ||
+      JSON.parse(out[`${prefix}collection_retention_v3`] || "null")?.value ||
       {};
   } catch {}
-  for (const [key, raw] of Object.entries(out))
-    if (key.startsWith(prefix + "deletion_archive_v3__entry_")) {
+  for (const [key, raw] of Object.entries(out)) {
+    if (key.startsWith(`${prefix}deletion_archive_v3__entry_`)) {
       try {
         const e = JSON.parse(raw);
-        if (!e.deleted)
+        if (!e.deleted) {
           buckets.set(key, {
             e,
             entries: Object.fromEntries(
               Object.entries(mergeDeletionEntries({}, e.value?.entries)).filter(
-                ([target]) => !expiredDeletionTarget(target, cuts, now),
+                ([target, stamp]) =>
+                  !expiredDeletionTarget(target, cuts, now, stamp),
               ),
             ),
           });
+        }
       } catch {}
     }
+  }
   for (const [key, raw] of Object.entries(out)) {
     const target = deletedTarget(key, user);
     if (!target) continue;
-    if (expiredDeletionTarget(target.target, cuts, now)) {
-      delete out[key];
-      continue;
-    }
     try {
       const e = JSON.parse(raw);
       if (e?.__ielts !== 2) continue;
+      if (expiredDeletionTarget(target.target, cuts, now, e.stamp)) {
+        delete out[key];
+        continue;
+      }
       let bucket = buckets.get(target.key);
       const stamp = bucket?.entries[target.target];
       if (
@@ -238,6 +248,7 @@ function compactDeletionData(input, user, fold = true, now = Date.now()) {
         delete out[key];
         continue;
       }
+      if (stamp && !e.deleted) delete bucket.entries[target.target];
       if (!fold || !e.deleted) continue;
       bucket ||= {
         e: { __ielts: 2, stamp: [0, "deletion-archive"] },
@@ -263,34 +274,36 @@ function compactDeletionData(input, user, fold = true, now = Date.now()) {
   return out;
 }
 function expandDeletionData(input, user) {
-  const out = { ...input },
-    prefix = user ? `myielts_u_${user}_` : "myielts_";
-  for (const [key, raw] of Object.entries(input))
-    if (key.startsWith(prefix + "deletion_archive_v3__entry_")) {
+  const out = { ...input };
+  const prefix = user ? `myielts_u_${user}_` : "myielts_";
+  for (const [key, raw] of Object.entries(input)) {
+    if (key.startsWith(`${prefix}deletion_archive_v3__entry_`)) {
       try {
         const e = JSON.parse(raw);
         for (const [target, stamp] of Object.entries(
           mergeDeletionEntries({}, e.value?.entries),
         )) {
-          const split = target.indexOf("|"),
-            base = target.slice(0, split),
-            id = target.slice(split + 1);
-          const destination = prefix + base + "__entry_" + encodeDeletedId(id);
+          const split = target.indexOf("|");
+          const base = target.slice(0, split);
+          const id = target.slice(split + 1);
+          const destination = `${prefix + base}__entry_${encodeDeletedId(id)}`;
           const old = out[destination] && JSON.parse(out[destination]);
           if (
             !old ||
             stamp[0] > old.stamp[0] ||
             (stamp[0] === old.stamp[0] && stamp[1] >= old.stamp[1])
-          )
+          ) {
             out[destination] = JSON.stringify({
               __ielts: 2,
               stamp,
               deleted: true,
             });
+          }
         }
         delete out[key];
       } catch {}
     }
+  }
   return out;
 }
 

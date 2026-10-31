@@ -111,14 +111,18 @@ function mergeLegacyValue(table, a, b) {
   if (table === "vocabulary_spell_v2") {
     const values = (value) =>
       typeof value === "string"
-        ? [value]
+        ? value.trim()
+          ? [value.trim()]
+          : []
         : Array.isArray(value?.alternatives)
-          ? value.alternatives.filter((v) => typeof v === "string")
+          ? value.alternatives
+              .filter((v) => typeof v === "string" && v.trim())
+              .map((v) => v.trim())
           : [];
     const alternatives = [...new Set([...values(a), ...values(b)])].sort();
     return alternatives.length <= 1
       ? alternatives[0] || ""
-      : { text: alternatives[0], alternatives };
+      : { text: alternatives[0], alternatives, requiresSelection: true };
   }
   if (table === "mistake_parts_v2") {
     return {
