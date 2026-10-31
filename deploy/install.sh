@@ -47,7 +47,7 @@ caddy version
 
 echo "==> 3/5 部署应用到 $APP_DIR"
 mkdir -p "$APP_DIR/data"
-cp "$SRC_DIR/server.js" "$SRC_DIR/sync-protocol.js" "$SRC_DIR/retention.js" "$SRC_DIR/package.json" "$SRC_DIR/package-lock.json" "$APP_DIR/"
+cp "$SRC_DIR/server.js" "$SRC_DIR/sync-protocol.js" "$SRC_DIR/retention.js" "$SRC_DIR/stats-archive.js" "$SRC_DIR/package.json" "$SRC_DIR/package-lock.json" "$APP_DIR/"
 cd "$APP_DIR"
 # 仅安装纯 JS 依赖（无 native 模块）；如已有 node_modules 则先清理，避免残留 better-sqlite3
 rm -rf node_modules/better-sqlite3
