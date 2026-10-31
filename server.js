@@ -1,3 +1,5 @@
+"use strict";
+const { expandDeletionData } = require("./retention");
 const { expandStatsData } = require("./stats-archive");
 // my-ielts sync server: 账号 + 学习数据多设备同步
 // 跑法: node --experimental-sqlite server.js  (Node 22+)
@@ -185,6 +187,16 @@ function isPrivateOrReservedIp(ip) {
       return isPrivateOrReservedIp(
         `${groups[6] >> 8}.${groups[6] & 255}.${groups[7] >> 8}.${groups[7] & 255}`,
       );
+    // Teredo embeds a server IPv4 plus an obfuscated client IPv4 (RFC 4380).
+    if (groups[0] === 0x2001 && groups[1] === 0) {
+      const server = `${groups[2] >> 8}.${groups[2] & 255}.${groups[3] >> 8}.${groups[3] & 255}`;
+      const hi = groups[6] ^ 0xffff,
+        lo = groups[7] ^ 0xffff;
+      return (
+        isPrivateOrReservedIp(server) ||
+        isPrivateOrReservedIp(`${hi >> 8}.${hi & 255}.${lo >> 8}.${lo & 255}`)
+      );
+    }
     const [g0, g1] = groups;
     if (g0 === 0 && g1 === 0 && groups.slice(2).every((g) => g === 0))
       return true; // ::/128
@@ -293,7 +305,22 @@ function auth(req, res, next) {
 }
 
 // 拉取：返回按账号校验后的条目快照
+function legacySyncView(data, user) {
+  const out = expandDeletionData(data, user);
+  const prefix = `myielts_u_${user}_vocabulary_spell_v2__entry_`;
+  for (const [key, raw] of Object.entries(out))
+    if (key.startsWith(prefix)) {
+      try {
+        const e = decode(raw);
+        if (!e.deleted && Array.isArray(e.value?.alternatives))
+          out[key] = JSON.stringify({ ...e, value: e.value.text });
+      } catch {}
+    }
+  return out;
+}
 function syncView(req, data, updatedAt) {
+  if (data && req.headers["x-ielts-deletes"] !== "1")
+    data = legacySyncView(data, req.user.username);
   if (req.headers["x-ielts-compact"] !== "1")
     return {
       data: data && expandStatsData(data, req.user.username),
@@ -340,6 +367,7 @@ function syncView(req, data, updatedAt) {
     data: data === null ? null : page,
     protocolVersion,
     compactStats: true,
+    compactDeletes: req.headers["x-ielts-deletes"] === "1",
     updatedAt,
     nextCursor: more
       ? Buffer.from(JSON.stringify([updatedAt, last, day])).toString(
@@ -366,13 +394,11 @@ app.get("/api/sync", auth, syncLimiter, (req, res) => {
   }
   const result = syncView(req, data, row?.updated_at || 0);
   if (result.error)
-    return res
-      .status(result.error)
-      .json({
-        ok: false,
-        message:
-          result.error === 409 ? "云端快照已变化，请重新拉取" : "无效分页参数",
-      });
+    return res.status(result.error).json({
+      ok: false,
+      message:
+        result.error === 409 ? "云端快照已变化，请重新拉取" : "无效分页参数",
+    });
   res.json({ ok: true, ...result });
 });
 
@@ -549,20 +575,27 @@ app.put("/api/sync", auth, syncLimiter, (req, res) => {
     const compact = req.headers["x-ielts-compact"] === "1";
     // Compact clients merge changed entries plus the small archive/retention metadata.
     // Legacy clients receive expanded writers so their lifetime totals remain intact.
+    const supportsDeletes = req.headers["x-ielts-deletes"] === "1";
+    const view = supportsDeletes
+      ? data
+      : legacySyncView(data, req.user.username);
     const reply = compact
       ? Object.fromEntries(
-          Object.entries(data).filter(
+          Object.entries(view).filter(
             ([key]) =>
               key in req.body.data ||
-              (key.includes("_stats_archive_v3__entry_") && data[key] !== old[key]) ||
+              ((key.includes("_stats_archive_v3__entry_") ||
+                key.includes("_deletion_archive_v3__entry_")) &&
+                view[key] !== old[key]) ||
               /_(?:collection_retention_v3|archive_retention_v2)$/.test(key),
           ),
         )
-      : expandStatsData(data, req.user.username);
+      : expandStatsData(view, req.user.username);
     res.json({
       ok: true,
       protocolVersion,
       compactStats: compact,
+      compactDeletes: supportsDeletes,
       data: reply,
       rejected,
       updatedAt: changed ? now : row?.updated_at || 0,

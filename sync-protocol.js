@@ -1,6 +1,10 @@
+"use strict";
 const { compactStatsData, mergeWriters } = require("./stats-archive");
-("use strict");
-const { pruneCollectionData } = require("./retention");
+const {
+  compactDeletionData,
+  mergeDeletionEntries,
+  pruneCollectionData,
+} = require("./retention");
 const mapBases = [
   "progress_v1",
   "vocabulary_spell_v2",
@@ -14,6 +18,7 @@ const mapBases = [
   "daily_resets_v2",
   "stats_parts_v2",
   "stats_archive_v3",
+  "deletion_archive_v3",
   "timer_sessions_v2",
   "checkin_years_v2",
 ];
@@ -25,6 +30,7 @@ const setBases = [
 const arrayBases = ["mock_history_v1", "task1_essays_v1", "task2_essays_v1"];
 const collectionBases = [...mapBases, ...setBases, ...arrayBases];
 const scalarBases = [
+  "typing_ignore_case_v2",
   "flashcard_daily_goal_v1",
   "listening179_daily_goal_v1",
   "reading538_daily_goal_v1",
@@ -102,6 +108,18 @@ function dateMs(value) {
 function mergeLegacyValue(table, a, b) {
   if (a === undefined || a === null) return b;
   if (b === undefined || b === null) return a;
+  if (table === "vocabulary_spell_v2") {
+    const values = (value) =>
+      typeof value === "string"
+        ? [value]
+        : Array.isArray(value?.alternatives)
+          ? value.alternatives.filter((v) => typeof v === "string")
+          : [];
+    const alternatives = [...new Set([...values(a), ...values(b)])].sort();
+    return alternatives.length <= 1
+      ? alternatives[0] || ""
+      : { text: alternatives[0], alternatives };
+  }
   if (table === "mistake_parts_v2") {
     return {
       ...a,
@@ -193,6 +211,29 @@ function mergeDataWithReport(previous, incoming, user, compact = false) {
     }
     const old = out[key] === undefined ? null : decode(out[key]);
     if (
+      base.startsWith("deletion_archive_v3__entry_") &&
+      !e.deleted &&
+      !old?.deleted
+    ) {
+      out[key] = JSON.stringify({
+        ...(!old || compare(e, old) > 0 ? e : old),
+        value: {
+          entries: mergeDeletionEntries(old?.value?.entries, e.value?.entries),
+        },
+      });
+    } else if (
+      base.startsWith("vocabulary_spell_v2__entry_") &&
+      old &&
+      !old.deleted &&
+      !e.deleted &&
+      old.stamp[0] === 0 &&
+      e.stamp[0] === 0
+    ) {
+      out[key] = JSON.stringify({
+        ...e,
+        value: mergeLegacyValue("vocabulary_spell_v2", old.value, e.value),
+      });
+    } else if (
       base.startsWith("stats_archive_v3__entry_") &&
       !e.deleted &&
       !old?.deleted
@@ -341,7 +382,11 @@ function mergeDataWithReport(previous, incoming, user, compact = false) {
     }
   }
   return {
-    data: compactStatsData(pruneCollectionData(out, user), user, compact),
+    data: compactDeletionData(
+      compactStatsData(pruneCollectionData(out, user), user, compact),
+      user,
+      compact,
+    ),
     rejected,
   };
 }

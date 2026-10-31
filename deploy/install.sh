@@ -104,11 +104,17 @@ if ! systemctl reload caddy; then
   else rm -f /etc/systemd/system/my-ielts-sync.service; fi
   systemctl daemon-reload
   if [ "$APP_WAS_ACTIVE" = 1 ]; then systemctl restart my-ielts-sync; else systemctl stop my-ielts-sync; fi
-  if [ -f "$CADDY_BACKUP" ]; then cp "$CADDY_BACKUP" /etc/caddy/Caddyfile; systemctl reload caddy; fi
+  if [ -f "$CADDY_BACKUP" ]; then
+    cp "$CADDY_BACKUP" /etc/caddy/Caddyfile
+    if ! systemctl reload caddy; then echo "恢复原 Caddyfile 后再次重载失败，请立即检查 Caddy 日志"; exit 1; fi
+  else
+    rm -f /etc/caddy/Caddyfile
+    echo "此前无 Caddyfile，已移除本次新增配置；请检查现有 Caddy 运行状态"
+  fi
   echo "Caddy 重载失败，已尝试恢复原配置"; exit 1
 fi
 sleep 3
 
 echo ""
 echo "部署完成，检查健康状态："
-curl -sk https://104-233-149-98.sslip.io/api/health || echo "（证书申请中，稍等 1-2 分钟再试）"
+curl -fsS --retry 10 --retry-delay 5 https://104-233-149-98.sslip.io/api/health || { echo "HTTPS 健康检查失败，请检查证书和 Caddy 日志"; exit 1; }
