@@ -329,10 +329,11 @@ function syncView(req, data, updatedAt) {
     };
   const keys = Object.keys(data || {}).sort();
   let after = "";
-  const day =
-    new Date().toDateString() +
-    ":" +
-    Math.floor((Date.now() + 8 * 3600000) / 86400000);
+  // 分页 cursor 的 day 只用 CST 日号作单一时钟基准：此前混用服务端本地
+  // 时区日期串与 CST 日号，两者在不同时刻翻日，分页拉取跨过任一翻日点
+  // 即 409。注意：部署前已发出的旧 cursor 会因 day 不一致 409 一次，客
+  // 户端按设计重拉（最多 3 次），无数据影响。
+  const day = String(Math.floor((Date.now() + 8 * 3600000) / 86400000));
   if (req.query.cursor) {
     let cursor;
     try {
