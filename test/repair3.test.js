@@ -190,3 +190,49 @@ test("capability-only sync GET reports current formats without returning account
   assert.equal(result.compactDeletes, true);
   assert.equal(result.data, null);
 });
+
+test("sync endpoints accept new writing and dictation data and advertise the capability", async () => {
+  const writing = "myielts_u_alice_aigrade_v2_extended";
+  const progress = "myielts_u_alice_dictation_progress_v1";
+  const headers = { "x-ielts-compact": "1", "x-ielts-deletes": "1" };
+  const first = await request(
+    "/sync",
+    "PUT",
+    {
+      protocolVersion: 2,
+      data: {
+        [writing]: raw({ score: 7 }, 20),
+        [progress]: raw(
+          { "cam18-test1:part1": { cursor: 1, updatedAt: 20 } },
+          20,
+        ),
+      },
+    },
+    headers,
+  );
+  assert.equal(first.status, 200);
+  assert.equal(first.studyExtensions, true);
+  assert.deepEqual(first.rejected, []);
+  const second = await request(
+    "/sync",
+    "PUT",
+    {
+      protocolVersion: 2,
+      data: {
+        [progress]: raw(
+          { "cam18-test1:part2": { cursor: 3, updatedAt: 21 } },
+          21,
+        ),
+      },
+    },
+    headers,
+  );
+  assert.deepEqual(second.rejected, []);
+  const pulled = await request("/sync", "GET", null, headers);
+  assert.equal(pulled.studyExtensions, true);
+  assert.ok(pulled.data[writing]);
+  assert.deepEqual(JSON.parse(pulled.data[progress]).value, {
+    "cam18-test1:part1": { cursor: 1, updatedAt: 20 },
+    "cam18-test1:part2": { cursor: 3, updatedAt: 21 },
+  });
+});

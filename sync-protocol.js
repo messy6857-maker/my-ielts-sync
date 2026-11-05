@@ -38,6 +38,8 @@ const scalarBases = [
   "stats_archive_v2",
   "checkin_archive_v2",
   "archive_retention_v2",
+  "archive_retention_writing_v3",
+  "dictation_progress_v1",
   "collection_retention_v3",
   "migration_version_v2",
 ];
@@ -66,7 +68,8 @@ function baseOf(key, user) {
       (suffix === undefined &&
         [...collectionBases, ...scalarBases, ...legacyBases].includes(base)) ||
       /^study_time_v1_[a-z\d-]+$/i.test(base) ||
-      /^aigrade_(?:speaking_)?v1_(?:[a-z\d]+_)?-?[a-z\d]+$/i.test(base))
+      /^aigrade_(?:speaking_)?v1_(?:[a-z\d]+_)?-?[a-z\d]+$/i.test(base) ||
+      /^aigrade_v2_[a-z\d]+$/i.test(base))
   )
     return base;
   return null;
@@ -170,7 +173,22 @@ function mergeLegacyValue(table, a, b) {
   }
   return a;
 }
-const archive = (base) => /^aigrade_(?:speaking_)?v1_/.test(base);
+const archiveMarkers = ["archive_retention_v2", "archive_retention_writing_v3"];
+function archiveMarker(base) {
+  if (/^aigrade_v2_/i.test(base)) return archiveMarkers[1];
+  return /^aigrade_(?:speaking_)?v1_/i.test(base) ? archiveMarkers[0] : null;
+}
+function mergeDictation(a, b) {
+  const latest = compare(a, b) >= 0 ? a : b;
+  const older = latest === a ? b : a;
+  const value = Object.assign(Object.create(null), older.value);
+  for (const [key, part] of Object.entries(latest.value || {})) {
+    const old = value[key];
+    if (!old || (part?.updatedAt ?? 0) >= (old.updatedAt ?? 0))
+      value[key] = part;
+  }
+  return { ...latest, value };
+}
 const past = (key, e, c) =>
   c &&
   (e.stamp[0] - c[0] ||
@@ -280,44 +298,69 @@ function mergeDataWithReport(previous, incoming, user, compact = false) {
         stamp: [0, "legacy"],
         value: mergeLegacyValue(base.split("__entry_")[0], old.value, e.value),
       });
+    } else if (
+      base === "dictation_progress_v1" &&
+      old &&
+      !old.deleted &&
+      !e.deleted
+    ) {
+      out[key] = JSON.stringify(mergeDictation(old, e));
     } else if (!old || compare(e, old) > 0) out[key] = JSON.stringify(e);
   }
-  // A monotonic retention watermark prevents stale devices from restoring pruned AI archives.
-  const marker = `myielts_u_${user}_archive_retention_v2`;
-  const cuts = [previous?.[marker], incoming[marker]]
-    .filter(Boolean)
-    .map((x) => {
-      try {
-        return decode(x).value?.cutoff;
-      } catch {
-        return undefined; // a rejected marker entry must not poison the merge
-      }
+  // Original-format watermarks never apply to v2 writing results.
+  const priorCuts = new Map();
+  const accountPrefix = `myielts_u_${user}_`;
+  for (const marker of archiveMarkers) {
+    const key = accountPrefix + marker;
+    const cuts = [previous?.[key], incoming[key]]
+      .filter(Boolean)
+      .flatMap((raw) => {
+        try {
+          const c = decode(raw).value?.cutoff;
+          return Array.isArray(c) &&
+            c.length === 3 &&
+            Number.isFinite(c[0]) &&
+            typeof c[1] === "string" &&
+            typeof c[2] === "string"
+            ? [c]
+            : [];
+        } catch {
+          return [];
+        }
+      })
+      .sort(
+        (a, b) =>
+          a[0] - b[0] || a[1].localeCompare(b[1]) || a[2].localeCompare(b[2]),
+      );
+    priorCuts.set(marker, cuts.at(-1));
+  }
+  const cuts = new Map(priorCuts);
+  const archives = Object.keys(out)
+    .flatMap((key) => {
+      const marker = archiveMarker(baseOf(key, user));
+      return marker ? [{ key, marker, entry: decode(out[key]) }] : [];
     })
-    .filter((x) => Array.isArray(x) && x.length === 3);
-  cuts.sort(
-    (a, b) =>
-      a[0] - b[0] ||
-      String(a[1]).localeCompare(String(b[1])) ||
-      String(a[2]).localeCompare(String(b[2])),
-  );
-  let cutoff = cuts.at(-1);
-  const entries = Object.keys(out)
-    .filter((k) => archive(baseOf(k, user)))
-    .map((key) => ({ key, e: decode(out[key]) }))
-    .sort((a, b) => compare(b.e, a.e) || b.key.localeCompare(a.key));
-  let bytes = 0,
-    kept = 0;
-  for (const { key, e } of entries) {
+    .sort((a, b) => compare(b.entry, a.entry) || b.key.localeCompare(a.key));
+  let bytes = 0;
+  let kept = 0;
+  for (const { key, marker, entry } of archives) {
+    if (entry.deleted || past(key, entry, priorCuts.get(marker))) continue;
     bytes += Buffer.byteLength(out[key]);
     kept++;
-    if ((kept > 30 || bytes > 1048576) && (!cutoff || !past(key, e, cutoff)))
-      cutoff = [...e.stamp, key];
+    if (
+      (kept > 30 || bytes > 1048576) &&
+      cuts.get(marker) === priorCuts.get(marker)
+    )
+      cuts.set(marker, [...entry.stamp, key]);
   }
-  if (cutoff) {
-    for (const { key, e } of entries) if (past(key, e, cutoff)) delete out[key];
-    const current = out[marker] ? decode(out[marker]) : null;
+  for (const { key, marker, entry } of archives)
+    if (past(key, entry, cuts.get(marker))) delete out[key];
+  for (const [marker, cutoff] of cuts) {
+    if (!cutoff) continue;
+    const key = accountPrefix + marker;
+    const current = out[key] ? decode(out[key]) : null;
     if (JSON.stringify(current?.value?.cutoff) !== JSON.stringify(cutoff))
-      out[marker] = JSON.stringify({
+      out[key] = JSON.stringify({
         __ielts: 2,
         stamp: [
           Math.max(Date.now(), (current?.stamp[0] || 0) + 1),

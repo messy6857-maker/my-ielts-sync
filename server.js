@@ -367,6 +367,7 @@ function syncView(req, data, updatedAt) {
   return {
     data: data === null ? null : page,
     protocolVersion,
+    studyExtensions: true,
     compactStats: true,
     compactDeletes: req.headers["x-ielts-deletes"] === "1",
     updatedAt,
@@ -382,6 +383,7 @@ app.get("/api/sync", auth, syncLimiter, (req, res) => {
     return res.json({
       ok: true,
       protocolVersion,
+      studyExtensions: true,
       compactStats: true,
       compactDeletes: true,
       data: null,
@@ -597,13 +599,16 @@ app.put("/api/sync", auth, syncLimiter, (req, res) => {
               ((key.includes("_stats_archive_v3__entry_") ||
                 key.includes("_deletion_archive_v3__entry_")) &&
                 view[key] !== old[key]) ||
-              /_(?:collection_retention_v3|archive_retention_v2)$/.test(key),
+              /_(?:collection_retention_v3|archive_retention_v2|archive_retention_writing_v3)$/.test(
+                key,
+              ),
           ),
         )
       : expandStatsData(view, req.user.username);
     res.json({
       ok: true,
       protocolVersion,
+      studyExtensions: true,
       compactStats: compact,
       compactDeletes: supportsDeletes,
       data: reply,
