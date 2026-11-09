@@ -79,7 +79,9 @@ sudo bash deploy/install.sh
 
 ### 听写进度与新版写作评分
 
-新版后端在同步响应声明 `studyExtensions: true`，接受 `dictation_progress_v1` 和 `aigrade_v2_*`。听写按套题和 Part 合并，同一 Part 保留更新时间较新的进度。旧服务曾以 `unknown-base` 拒绝的这两类有效条目，在客户端收到新版能力后重新进入上传队列。旧版 AI 清理线只作用于 v1，v2 写作评分使用独立清理线，两类仍共享每账号 30 份、1 MiB 的容量上限。
+新版后端在同步响应声明 `studyExtensions: true`，接受 `dictation_progress_v1` 和 `aigrade_v2_*`。听写按套题和 Part 合并，同一 Part 保留更新时间较新的进度。旧服务曾以 `unknown-base` 拒绝的这两类有效条目，在客户端收到新版能力后重新进入上传队列。旧版写作和口语评分退出自动裁剪，原有单条删除标记继续生效；旧版裁剪水位不再生效。新版写作独立保留每账号最近 30 份、最多 1 MiB。裁剪水位通过 GET 和紧凑 PUT 返回。
+
+新版响应也声明 `studyProgressEntries: true`，接受 `listening179_done_v1` 逐行记录和 `study_daily_goal_v1` 时长目标，客户端收到声明后重试这两类此前以 `unknown-base` 隔离的条目。
 
 新版字段写入后，直接换回不识别它们的后端也会使下一次 PUT 丢弃这些记录。升级前保留数据库备份。已经被旧版清理线裁掉的记录需要从可用备份中按账号核对恢复。
 

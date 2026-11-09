@@ -63,24 +63,34 @@ test("a previously inflated v1 cutoff cannot sweep a v2 writing result", () => {
   assert.ok(result.data[v2]);
 });
 
-test("mixed archive retention remains bounded and a stale device cannot resurrect a trimmed v2 result", () => {
+test("only v2 writing uses the budget and its cutoff survives stale replay", () => {
+  const legacy = key("aigrade_speaking_v1_p2_old");
+  const deleted = key("aigrade_v1_deleted");
+  const retiredCutoff = key("archive_retention_v2");
+  const previous = {
+    [legacy]: raw(1, { score: 6 }),
+    [deleted]: raw(35, null, true),
+    [retiredCutoff]: raw(36, { cutoff: [30, "test", deleted] }),
+  };
   const payload = Object.fromEntries(
-    Array.from({ length: 32 }, (_, i) => [
-      key((i < 2 ? "aigrade_v2_" : "aigrade_v1_") + i),
-      raw(i + 1, { score: 6 }),
+    Array.from({ length: 31 }, (_, i) => [
+      key("aigrade_v2_" + i),
+      raw(i + 2, { score: 7 }),
     ]),
   );
-  const first = mergeDataWithReport({}, payload, user);
+  payload[deleted] = raw(10, { score: 6 });
+  const first = mergeDataWithReport(previous, payload, user);
   assert.equal(
-    Object.keys(first.data).filter((k) => k.includes("_aigrade_")).length,
+    Object.keys(first.data).filter((k) => k.includes("_aigrade_v2_")).length,
     30,
   );
+  assert.ok(first.data[legacy]);
+  assert.equal(first.data[retiredCutoff], undefined);
+  assert.equal(JSON.parse(first.data[deleted]).deleted, true);
   assert.ok(first.data[key("archive_retention_writing_v3")]);
   assert.equal(first.data[key("aigrade_v2_0")], undefined);
   const replay = mergeDataWithReport(first.data, payload, user);
   assert.equal(replay.data[key("aigrade_v2_0")], undefined);
-  assert.equal(
-    Object.keys(replay.data).filter((k) => k.includes("_aigrade_")).length,
-    30,
-  );
+  assert.ok(replay.data[legacy]);
+  assert.equal(JSON.parse(replay.data[deleted]).deleted, true);
 });

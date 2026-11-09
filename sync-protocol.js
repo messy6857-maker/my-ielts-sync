@@ -10,6 +10,8 @@ const mapBases = [
   "vocabulary_spell_v2",
   "sr_vocabulary_v1",
   "listening179_sr_v1",
+  "listening179_done_v1",
+  "study_daily_goal_v1",
   "reading538_sr_v1",
   "corpus_sr_v1",
   "mistake_parts_v2",
@@ -173,11 +175,6 @@ function mergeLegacyValue(table, a, b) {
   }
   return a;
 }
-const archiveMarkers = ["archive_retention_v2", "archive_retention_writing_v3"];
-function archiveMarker(base) {
-  if (/^aigrade_v2_/i.test(base)) return archiveMarkers[1];
-  return /^aigrade_(?:speaking_)?v1_/i.test(base) ? archiveMarkers[0] : null;
-}
 function mergeDictation(a, b) {
   const latest = compare(a, b) >= 0 ? a : b;
   const older = latest === a ? b : a;
@@ -307,60 +304,51 @@ function mergeDataWithReport(previous, incoming, user, compact = false) {
       out[key] = JSON.stringify(mergeDictation(old, e));
     } else if (!old || compare(e, old) > 0) out[key] = JSON.stringify(e);
   }
-  // Original-format watermarks never apply to v2 writing results.
-  const priorCuts = new Map();
+  // Legacy writing and speaking are retained. The historical automatic
+  // cutoff is retired; explicit per-entry deletion envelopes still win.
   const accountPrefix = `myielts_u_${user}_`;
-  for (const marker of archiveMarkers) {
-    const key = accountPrefix + marker;
-    const cuts = [previous?.[key], incoming[key]]
-      .filter(Boolean)
-      .flatMap((raw) => {
-        try {
-          const c = decode(raw).value?.cutoff;
-          return Array.isArray(c) &&
-            c.length === 3 &&
-            Number.isFinite(c[0]) &&
-            typeof c[1] === "string" &&
-            typeof c[2] === "string"
-            ? [c]
-            : [];
-        } catch {
-          return [];
-        }
-      })
-      .sort(
-        (a, b) =>
-          a[0] - b[0] || a[1].localeCompare(b[1]) || a[2].localeCompare(b[2]),
-      );
-    priorCuts.set(marker, cuts.at(-1));
-  }
-  const cuts = new Map(priorCuts);
-  const archives = Object.keys(out)
-    .flatMap((key) => {
-      const marker = archiveMarker(baseOf(key, user));
-      return marker ? [{ key, marker, entry: decode(out[key]) }] : [];
+  delete out[accountPrefix + "archive_retention_v2"];
+  const writingMarker = accountPrefix + "archive_retention_writing_v3";
+  const priorCut = [previous?.[writingMarker], incoming[writingMarker]]
+    .flatMap((raw) => {
+      try {
+        const c = decode(raw).value?.cutoff;
+        return Array.isArray(c) &&
+          c.length === 3 &&
+          Number.isFinite(c[0]) &&
+          typeof c[1] === "string" &&
+          typeof c[2] === "string"
+          ? [c]
+          : [];
+      } catch {
+        return [];
+      }
     })
+    .sort(
+      (a, b) =>
+        a[0] - b[0] || a[1].localeCompare(b[1]) || a[2].localeCompare(b[2]),
+    )
+    .at(-1);
+  let cutoff = priorCut;
+  const archives = Object.keys(out)
+    .filter((key) => /^aigrade_v2_/i.test(key.slice(accountPrefix.length)))
+    .map((key) => ({ key, entry: decode(out[key]) }))
     .sort((a, b) => compare(b.entry, a.entry) || b.key.localeCompare(a.key));
   let bytes = 0;
   let kept = 0;
-  for (const { key, marker, entry } of archives) {
-    if (entry.deleted || past(key, entry, priorCuts.get(marker))) continue;
+  for (const { key, entry } of archives) {
+    if (entry.deleted || past(key, entry, priorCut)) continue;
     bytes += Buffer.byteLength(out[key]);
     kept++;
-    if (
-      (kept > 30 || bytes > 1048576) &&
-      cuts.get(marker) === priorCuts.get(marker)
-    )
-      cuts.set(marker, [...entry.stamp, key]);
+    if ((kept > 30 || bytes > 1048576) && cutoff === priorCut)
+      cutoff = [...entry.stamp, key];
   }
-  for (const { key, marker, entry } of archives)
-    if (past(key, entry, cuts.get(marker))) delete out[key];
-  for (const [marker, cutoff] of cuts) {
-    if (!cutoff) continue;
-    const key = accountPrefix + marker;
-    const current = out[key] ? decode(out[key]) : null;
+  for (const { key, entry } of archives)
+    if (past(key, entry, cutoff)) delete out[key];
+  if (cutoff) {
+    const current = out[writingMarker] ? decode(out[writingMarker]) : null;
     if (JSON.stringify(current?.value?.cutoff) !== JSON.stringify(cutoff))
-      out[key] = JSON.stringify({
+      out[writingMarker] = JSON.stringify({
         __ielts: 2,
         stamp: [
           Math.max(Date.now(), (current?.stamp[0] || 0) + 1),

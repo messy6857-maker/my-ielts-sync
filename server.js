@@ -318,6 +318,7 @@ function legacySyncView(data, user) {
     }
   return out;
 }
+const studyCapabilities = { studyExtensions: true, studyProgressEntries: true };
 function syncView(req, data, updatedAt) {
   if (data && req.headers["x-ielts-deletes"] !== "1")
     data = legacySyncView(data, req.user.username);
@@ -325,6 +326,7 @@ function syncView(req, data, updatedAt) {
     return {
       data: data && expandStatsData(data, req.user.username),
       protocolVersion,
+      ...studyCapabilities,
       updatedAt,
     };
   const keys = Object.keys(data || {}).sort();
@@ -367,6 +369,7 @@ function syncView(req, data, updatedAt) {
   return {
     data: data === null ? null : page,
     protocolVersion,
+    ...studyCapabilities,
     compactStats: true,
     compactDeletes: req.headers["x-ielts-deletes"] === "1",
     updatedAt,
@@ -382,6 +385,7 @@ app.get("/api/sync", auth, syncLimiter, (req, res) => {
     return res.json({
       ok: true,
       protocolVersion,
+      ...studyCapabilities,
       compactStats: true,
       compactDeletes: true,
       data: null,
@@ -597,13 +601,14 @@ app.put("/api/sync", auth, syncLimiter, (req, res) => {
               ((key.includes("_stats_archive_v3__entry_") ||
                 key.includes("_deletion_archive_v3__entry_")) &&
                 view[key] !== old[key]) ||
-              /_(?:collection_retention_v3|archive_retention_v2)$/.test(key),
+              /_(?:collection_retention_v3|archive_retention_writing_v3)$/.test(key),
           ),
         )
       : expandStatsData(view, req.user.username);
     res.json({
       ok: true,
       protocolVersion,
+      ...studyCapabilities,
       compactStats: compact,
       compactDeletes: supportsDeletes,
       data: reply,
@@ -642,14 +647,11 @@ app.post("/api/ai/chat", auth, aiLimiter, async (req, res) => {
       .status(400)
       .json({ ok: false, message: "API 地址不在允许列表中" });
   const host = normalizeAiHost(url.hostname);
-  const isOpenAI = host === "api.openai.com";
-  // 推理强度（reasoning_effort）：只对支持的模型转发——DeepSeek 全系、
-  // OpenAI 推理模型（o 系列、GPT-5/6）；其余模型收到该参数会直接报错，所以不发。
-  const supportsReasoningEffort =
-    host === "api.deepseek.com" ||
-    (isOpenAI && /^(o\d|gpt-5|gpt-6)/.test(model));
-  // 不接受 temperature 的模型：OpenAI o 系列、GPT-6 全系（GPT-5 接受 temperature，照常发）。
-  const omitTemperature = isOpenAI && /^(o\d|gpt-6)/.test(model);
+  const deepseek = host === "api.deepseek.com";
+  const openAIReasoning =
+    host === "api.openai.com" &&
+    /^(?:o\d|gpt-[56](?:[.-]|$))/.test(model) &&
+    !String(model).includes("-chat-");
   // SSRF 纵深：白名单 host 若被 DNS 劫持/重绑定到内网地址，fetch 前拦截。
   // 仅当解析结果明确落在私有/保留段时拒绝；DNS 解析失败不拦截，
   // 交给上游 fetch 自然报错（避免解析抖动误杀正常请求）。
@@ -671,13 +673,19 @@ app.post("/api/ai/chat", auth, aiLimiter, async (req, res) => {
   }
   try {
     const payload = { model, messages };
-    if (!omitTemperature)
+    if (deepseek) {
+      // Older clients sent medium for the default DeepSeek tier.
+      payload.reasoning_effort =
+        reasoningEffort === "low" || reasoningEffort === "max"
+          ? reasoningEffort
+          : "high";
+    } else if (openAIReasoning) {
+      // GPT-5 with reasoning enabled also rejects sampling controls.
+      if (["low", "medium", "high"].includes(reasoningEffort))
+        payload.reasoning_effort = reasoningEffort;
+    } else {
       payload.temperature = temperature ?? 0.3;
-    if (
-      supportsReasoningEffort &&
-      ["low", "medium", "high"].includes(reasoningEffort)
-    )
-      payload.reasoning_effort = reasoningEffort;
+    }
     const r = await fetch(url, {
       method: "POST",
       redirect: "error",

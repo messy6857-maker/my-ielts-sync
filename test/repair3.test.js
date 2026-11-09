@@ -236,3 +236,88 @@ test("sync endpoints accept new writing and dictation data and advertise the cap
     "cam18-test1:part2": { cursor: 3, updatedAt: 21 },
   });
 });
+
+test("new progress records sync and compact writes return the writing cutoff", async () => {
+  const username = "novrepair";
+  const registered = await request("/register", "POST", {
+    username,
+    password: "local-password",
+  });
+  const headers = {
+    authorization: "Bearer " + registered.token,
+    "x-ielts-compact": "1",
+    "x-ielts-deletes": "1",
+  };
+  const own = (base) => `myielts_u_${username}_${base}`;
+  const row = own("listening179_done_v1__entry_0031");
+  const goal = own("study_daily_goal_v1__entry_0067006f0061006c");
+  const speaking = own("aigrade_speaking_v1_p2_old");
+  const cutoff = own("archive_retention_writing_v3");
+  for (const route of ["/sync", "/sync?capabilities=1"]) {
+    const result = await request(route, "GET", undefined, headers);
+    assert.equal(result.studyExtensions, true);
+    assert.equal(result.studyProgressEntries, true);
+  }
+  const writing = Array.from({ length: 31 }, (_, i) => [
+    own("aigrade_v2_" + i),
+    raw({ score: 7 }, i + 2),
+  ]);
+  const first = await request("/sync", "PUT", {
+    protocolVersion: 2,
+    data: {
+      ...Object.fromEntries(writing.slice(0, 30)),
+      [row]: raw({ doneAt: 1 }),
+      [goal]: raw({ minutes: 90 }),
+      [speaking]: raw({ score: 6 }, 1),
+    },
+  }, headers);
+  assert.deepEqual(first.rejected, []);
+  assert.equal(first.data[cutoff], undefined);
+  const next = await request("/sync", "PUT", {
+    protocolVersion: 2,
+    data: Object.fromEntries(writing.slice(30)),
+  }, headers);
+  assert.equal(next.studyProgressEntries, true);
+  assert.ok(next.data[cutoff]);
+  const pulled = await request("/sync", "GET", undefined, headers);
+  assert.ok(pulled.data[speaking]);
+  assert.equal(pulled.data[writing[0][0]], undefined);
+  assert.deepEqual(JSON.parse(pulled.data[row]).value, { doneAt: 1 });
+  assert.deepEqual(JSON.parse(pulled.data[goal]).value, { minutes: 90 });
+});
+
+test("AI chat forwards valid reasoning tiers and omits sampling parameters for reasoning models", async (t) => {
+  const dns = require("node:dns");
+  t.mock.method(dns.promises, "lookup", async () => [{ address: "8.8.8.8", family: 4 }]);
+  const fetchLocal = globalThis.fetch;
+  let upstream;
+  t.mock.method(globalThis, "fetch", async (url, options) => {
+    if (typeof url === "string" && url.startsWith(base))
+      return fetchLocal(url, options);
+    upstream = JSON.parse(options.body);
+    return { ok: true, json: async () => ({ choices: [] }) };
+  });
+  async function chat(host, model, reasoningEffort) {
+    const result = await request("/ai/chat", "POST", {
+      baseUrl: host,
+      apiKey: "fake-audit-key",
+      model,
+      messages: [{ role: "user", content: "ping" }],
+      reasoningEffort,
+      temperature: 0.3,
+    });
+    assert.equal(result.status, 200);
+    return upstream;
+  }
+  for (const [effort, expected] of [["low", "low"], ["medium", "high"], ["max", "max"]]) {
+    const p = await chat("https://api.deepseek.com", "deepseek-flash", effort);
+    assert.equal(p.reasoning_effort, expected);
+    assert.equal(p.temperature, undefined);
+  }
+  const reasoned = await chat("https://api.openai.com/v1", "gpt-5.4", "high");
+  assert.equal(reasoned.reasoning_effort, "high");
+  assert.equal(reasoned.temperature, undefined);
+  const ordinary = await chat("https://api.openai.com/v1", "gpt-4o-mini", "high");
+  assert.equal(ordinary.reasoning_effort, undefined);
+  assert.equal(ordinary.temperature, 0.3);
+});

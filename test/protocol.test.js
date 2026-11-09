@@ -153,10 +153,10 @@ test('concurrent yearly check-ins are unioned', () => {
     [1, 2, 3],
   )
 })
-test('AI archives are capped and stale devices cannot restore pruned results', () => {
+test('v2 writing archives are capped and stale devices cannot restore pruned results', () => {
   const incoming = Object.fromEntries(
     Array.from({ length: 35 }, (_, i) => [
-      key('aigrade_v1_' + i),
+      key('aigrade_v2_' + i),
       value({ essay: i }, i + 1),
     ]),
   )
