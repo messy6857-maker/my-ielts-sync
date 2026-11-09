@@ -128,7 +128,7 @@ function storeSyncGet(uid, updatedAt, data) {
 // AI 中转白名单：只允许代码里真实存在的默认 AI 端点 host。
 // 前端默认 baseUrl（useAISettings.ts）为 https://api-cdn.thehive.ai/api/v3；
 // 设置页 placeholder 的 deepseek 地址只是示例占位、并非默认值，不列入。
-const AI_ALLOWED_HOSTS = ["api-cdn.thehive.ai"];
+const AI_ALLOWED_HOSTS = ["api-cdn.thehive.ai", "api.openai.com", "api.deepseek.com"];
 // 白名单 hostname 归一化：URL 解析保留尾点（api-cdn.thehive.ai.），
 // 校验前去掉尾点，避免合法地址被误拒；大小写已由 URL 解析自动小写。
 function normalizeAiHost(hostname) {
@@ -367,7 +367,6 @@ function syncView(req, data, updatedAt) {
   return {
     data: data === null ? null : page,
     protocolVersion,
-    studyExtensions: true,
     compactStats: true,
     compactDeletes: req.headers["x-ielts-deletes"] === "1",
     updatedAt,
@@ -383,7 +382,6 @@ app.get("/api/sync", auth, syncLimiter, (req, res) => {
     return res.json({
       ok: true,
       protocolVersion,
-      studyExtensions: true,
       compactStats: true,
       compactDeletes: true,
       data: null,
@@ -599,16 +597,13 @@ app.put("/api/sync", auth, syncLimiter, (req, res) => {
               ((key.includes("_stats_archive_v3__entry_") ||
                 key.includes("_deletion_archive_v3__entry_")) &&
                 view[key] !== old[key]) ||
-              /_(?:collection_retention_v3|archive_retention_v2|archive_retention_writing_v3)$/.test(
-                key,
-              ),
+              /_(?:collection_retention_v3|archive_retention_v2)$/.test(key),
           ),
         )
       : expandStatsData(view, req.user.username);
     res.json({
       ok: true,
       protocolVersion,
-      studyExtensions: true,
       compactStats: compact,
       compactDeletes: supportsDeletes,
       data: reply,
@@ -629,7 +624,7 @@ app.put("/api/sync", auth, syncLimiter, (req, res) => {
 // 所有登录账号可用，每人用自己的 API Key
 app.post("/api/ai/chat", auth, aiLimiter, async (req, res) => {
   // 所有登录账号可用，每人用自己的 API Key
-  const { baseUrl, apiKey, model, messages, temperature } = req.body || {};
+  const { baseUrl, apiKey, model, messages, temperature, reasoningEffort } = req.body || {};
   if (!baseUrl || !apiKey || !model || !Array.isArray(messages))
     return res
       .status(400)
@@ -646,6 +641,13 @@ app.post("/api/ai/chat", auth, aiLimiter, async (req, res) => {
     return res
       .status(400)
       .json({ ok: false, message: "API 地址不在允许列表中" });
+  const host = normalizeAiHost(url.hostname);
+  // 推理强度（reasoning_effort）：只对支持的模型转发——DeepSeek 全系、
+  // OpenAI o 系列；其余模型收到该参数会直接报错，所以不发。
+  const supportsReasoningEffort =
+    host === "api.deepseek.com" || (host === "api.openai.com" && /^o\d/.test(model));
+  // OpenAI o 系列不接受 temperature，带上会报 400，推理模型不发该参数。
+  const isOpenAIReasoning = host === "api.openai.com" && /^o\d/.test(model);
   // SSRF 纵深：白名单 host 若被 DNS 劫持/重绑定到内网地址，fetch 前拦截。
   // 仅当解析结果明确落在私有/保留段时拒绝；DNS 解析失败不拦截，
   // 交给上游 fetch 自然报错（避免解析抖动误杀正常请求）。
@@ -666,6 +668,14 @@ app.post("/api/ai/chat", auth, aiLimiter, async (req, res) => {
       .json({ ok: false, message: "API 地址解析到内网地址，已拒绝" });
   }
   try {
+    const payload = { model, messages };
+    if (!isOpenAIReasoning)
+      payload.temperature = temperature ?? 0.3;
+    if (
+      supportsReasoningEffort &&
+      ["low", "medium", "high"].includes(reasoningEffort)
+    )
+      payload.reasoning_effort = reasoningEffort;
     const r = await fetch(url, {
       method: "POST",
       redirect: "error",
@@ -673,11 +683,7 @@ app.post("/api/ai/chat", auth, aiLimiter, async (req, res) => {
         "Content-Type": "application/json",
         Authorization: "Bearer " + apiKey,
       },
-      body: JSON.stringify({
-        model,
-        messages,
-        temperature: temperature ?? 0.3,
-      }),
+      body: JSON.stringify(payload),
       signal: AbortSignal.timeout(120000),
     });
     const data = await r.json().catch(() => null);
