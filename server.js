@@ -642,12 +642,14 @@ app.post("/api/ai/chat", auth, aiLimiter, async (req, res) => {
       .status(400)
       .json({ ok: false, message: "API 地址不在允许列表中" });
   const host = normalizeAiHost(url.hostname);
+  const isOpenAI = host === "api.openai.com";
   // 推理强度（reasoning_effort）：只对支持的模型转发——DeepSeek 全系、
-  // OpenAI o 系列；其余模型收到该参数会直接报错，所以不发。
+  // OpenAI 推理模型（o 系列、GPT-5/6）；其余模型收到该参数会直接报错，所以不发。
   const supportsReasoningEffort =
-    host === "api.deepseek.com" || (host === "api.openai.com" && /^o\d/.test(model));
-  // OpenAI o 系列不接受 temperature，带上会报 400，推理模型不发该参数。
-  const isOpenAIReasoning = host === "api.openai.com" && /^o\d/.test(model);
+    host === "api.deepseek.com" ||
+    (isOpenAI && /^(o\d|gpt-5|gpt-6)/.test(model));
+  // 不接受 temperature 的模型：OpenAI o 系列、GPT-6 全系（GPT-5 接受 temperature，照常发）。
+  const omitTemperature = isOpenAI && /^(o\d|gpt-6)/.test(model);
   // SSRF 纵深：白名单 host 若被 DNS 劫持/重绑定到内网地址，fetch 前拦截。
   // 仅当解析结果明确落在私有/保留段时拒绝；DNS 解析失败不拦截，
   // 交给上游 fetch 自然报错（避免解析抖动误杀正常请求）。
@@ -669,7 +671,7 @@ app.post("/api/ai/chat", auth, aiLimiter, async (req, res) => {
   }
   try {
     const payload = { model, messages };
-    if (!isOpenAIReasoning)
+    if (!omitTemperature)
       payload.temperature = temperature ?? 0.3;
     if (
       supportsReasoningEffort &&
