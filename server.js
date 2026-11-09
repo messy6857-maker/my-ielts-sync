@@ -697,6 +697,48 @@ app.post("/api/ai/chat", auth, aiLimiter, async (req, res) => {
   }
 });
 
+// AI 服务商自动识别：用户只给 Key，后端按顺序试三个服务商的 chat/completions，
+// 哪个返回 200 就说明 Key 属于它。只发最小的 ping 请求（max_tokens: 1），不耗什么 token。
+// URL 是写死的三个官方地址，不接受用户传地址，无 SSRF 风险。
+// 注意：OpenAI 与 DeepSeek 的 Key 都是 sk- 开头，光看格式分不出来，必须真去试。
+const AI_DETECT_CANDIDATES = [
+  { id: "openai", label: "OpenAI", baseUrl: "https://api.openai.com/v1", model: "gpt-4o-mini" },
+  { id: "deepseek", label: "DeepSeek 官方", baseUrl: "https://api.deepseek.com", model: "deepseek-flash" },
+  { id: "hive", label: "Hive", baseUrl: "https://api-cdn.thehive.ai/api/v3", model: "deepseek-ai/deepseek-v4.1-flash-1017" },
+];
+app.post("/api/ai/detect", auth, aiLimiter, async (req, res) => {
+  const { apiKey } = req.body || {};
+  if (!apiKey || typeof apiKey !== "string" || !apiKey.trim())
+    return res.status(400).json({ ok: false, message: "请先填写 API Key" });
+  const key = apiKey.trim();
+  for (const cand of AI_DETECT_CANDIDATES) {
+    try {
+      const url = new URL(cand.baseUrl.replace(/\/+$/, "") + "/chat/completions");
+      const r = await fetch(url, {
+        method: "POST",
+        redirect: "error",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: "Bearer " + key,
+        },
+        body: JSON.stringify({
+          model: cand.model,
+          messages: [{ role: "user", content: "ping" }],
+          max_tokens: 1,
+        }),
+        signal: AbortSignal.timeout(15000),
+      });
+      if (r.ok)
+        return res.json({ ok: true, provider: cand.id, label: cand.label, baseUrl: cand.baseUrl });
+    } catch {
+      // 超时/网络错误，继续试下一个
+    }
+  }
+  return res
+    .status(401)
+    .json({ ok: false, message: "这个 Key 在 OpenAI、DeepSeek、Hive 都没通过，请检查 Key 是否正确" });
+});
+
 // Express also routes synchronous cron/SQLite failures here; clients always receive JSON.
 // body-parser 自带 status（畸形 JSON 400、超限 413）属于客户端问题，原样保留；
 // 只有真正的服务端异常才统一成 500，否则客户端问题会被误报成服务端故障。
