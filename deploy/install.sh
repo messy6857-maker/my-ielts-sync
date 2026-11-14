@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
 # my-ielts sync server 一键部署（Debian 12）
 # 用法：把 my-ielts-sync 目录传到 VPS 后，执行 sudo bash deploy/install.sh
+# 域名默认是当前线上地址（前端 src/sync-config.ts 的 SYNC_API_BASE），换服务器时用
+#   sudo DOMAIN=新IP横线写法.sslip.io bash deploy/install.sh
+# 并同步修改前端的 SYNC_API_BASE。
 set -euo pipefail
 
 APP_DIR=/opt/my-ielts-sync
@@ -8,6 +11,9 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 SRC_DIR="$(dirname "$SCRIPT_DIR")"
 SYNC_PORT="${PORT:-3001}"
 [[ "$SYNC_PORT" =~ ^[0-9]+$ ]] && (( SYNC_PORT >= 1 && SYNC_PORT <= 65535 )) || { echo "PORT 必须为 1–65535"; exit 1; }
+SYNC_DOMAIN="${DOMAIN:-38-64-63-20.sslip.io}"
+[[ "$SYNC_DOMAIN" =~ ^[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?$ ]] || { echo "DOMAIN 不合法：$SYNC_DOMAIN"; exit 1; }
+echo "==> 部署域名：$SYNC_DOMAIN（端口 $SYNC_PORT）"
 
 echo "==> 1/5 安装 Node.js 22"
 NEED_NODE=0
@@ -67,7 +73,7 @@ APP_WAS_ACTIVE=0
 if systemctl is-active --quiet my-ielts-sync; then APP_WAS_ACTIVE=1; fi
 CADDY_CANDIDATE=$(mktemp)
 trap 'rm -f "$CADDY_CANDIDATE"; rm -rf "$CONFIG_BACKUP_DIR"' EXIT
-sed "s/__SYNC_PORT__/$SYNC_PORT/g" "$SCRIPT_DIR/Caddyfile" > "$CADDY_CANDIDATE"
+sed -e "s/__SYNC_PORT__/$SYNC_PORT/g" -e "s/__SYNC_DOMAIN__/$SYNC_DOMAIN/g" "$SCRIPT_DIR/Caddyfile" > "$CADDY_CANDIDATE"
 caddy validate --config "$CADDY_CANDIDATE" --adapter caddyfile
 
 echo "==> 4/5 配置 systemd 服务"
@@ -117,7 +123,7 @@ sleep 3
 
 echo ""
 echo "部署完成，检查健康状态："
-if ! curl -fsS --retry 10 --retry-delay 5 --retry-all-errors https://104-233-149-98.sslip.io/api/health; then
+if ! curl -fsS --retry 10 --retry-delay 5 --retry-all-errors "https://${SYNC_DOMAIN}/api/health"; then
   echo "应用已启动且本机健康检查通过，但 HTTPS 部署验证尚未通过；可能仍在签发证书，请检查 Caddy 日志并单独重试 HTTPS 健康检查，无需重新安装。"
   exit 2
 fi
