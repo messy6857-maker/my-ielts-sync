@@ -67,6 +67,23 @@ db.exec(`
 `);
 
 const USERNAME_RE = /^[a-zA-Z0-9_\u4e00-\u9fa5]{2,20}$/;
+// 新注册密码：至少 8 位；bcrypt 只取前 72 字节，超出部分会被忽略，所以直接拒绝。
+// 登录不受影响，旧的 4 位密码照常可用。
+const MIN_PASSWORD_LENGTH = 8;
+const MAX_PASSWORD_BYTES = 72;
+// 用户不存在时也做一次 bcrypt 比较，避免靠响应时间判断用户名是否存在
+let dummyPasswordHash = null;
+function dummyHash() {
+  dummyPasswordHash ??= bcrypt.hashSync(crypto.randomBytes(16).toString("hex"), 10);
+  return dummyPasswordHash;
+}
+// 定时任务令牌：恒定时间比较（先取 SHA-256 摘要，长度一致）
+function cronAuthorized(req) {
+  const given = req.headers["x-cron-token"];
+  if (!CRON_TOKEN || typeof given !== "string") return false;
+  const digest = (value) => crypto.createHash("sha256").update(value).digest();
+  return crypto.timingSafeEqual(digest(given), digest(CRON_TOKEN));
+}
 
 const app = express();
 // 只信任本机 Caddy 这一跳反代，否则 req.ip 对所有用户都是 127.0.0.1，
@@ -250,8 +267,15 @@ app.post("/api/register", authLimiter, async (req, res) => {
       ok: false,
       message: "用户名需为 2-20 位字母、数字、下划线或中文",
     });
-  if (password.length < 4)
-    return res.status(400).json({ ok: false, message: "密码至少 4 位" });
+  if (password.length < MIN_PASSWORD_LENGTH)
+    return res
+      .status(400)
+      .json({ ok: false, message: `密码至少 ${MIN_PASSWORD_LENGTH} 位` });
+  if (Buffer.byteLength(password, "utf8") > MAX_PASSWORD_BYTES)
+    return res.status(400).json({
+      ok: false,
+      message: "密码太长（最多 72 个英文字符或 24 个中文字）",
+    });
   const exists = db
     .prepare("SELECT id FROM users WHERE username = ?")
     .get(username);
@@ -279,8 +303,10 @@ app.post("/api/login", authLimiter, async (req, res) => {
   const user = db
     .prepare("SELECT * FROM users WHERE username = ?")
     .get(username);
-  if (!user)
+  if (!user) {
+    await bcrypt.compare(password, dummyHash());
     return res.status(401).json({ ok: false, message: "用户名或密码不正确" });
+  }
   const match = await bcrypt.compare(password, user.password_hash);
   if (!match)
     return res.status(401).json({ ok: false, message: "用户名或密码不正确" });
@@ -421,8 +447,7 @@ app.get("/api/sync", auth, syncLimiter, (req, res) => {
 // studiedAt 用 dueAt - interval 反推；date 为北京时间 YYYY-MM-DD
 // 定时任务专用：列出所有用户名（只读，需 X-Cron-Token），用于按账号生成每日阅读
 app.get("/api/cron/users", (req, res) => {
-  const token = req.headers["x-cron-token"];
-  if (!CRON_TOKEN || token !== CRON_TOKEN)
+  if (!cronAuthorized(req))
     return res.status(401).json({ ok: false, message: "unauthorized" });
   const rows = db.prepare("SELECT username FROM users ORDER BY username").all();
   res.json({
@@ -433,8 +458,7 @@ app.get("/api/cron/users", (req, res) => {
 });
 // 定时任务专用：存入某用户某天的词汇阅读（只读，需 X-Cron-Token）
 app.post("/api/cron/daily-reading", (req, res) => {
-  const token = req.headers["x-cron-token"];
-  if (!CRON_TOKEN || token !== CRON_TOKEN)
+  if (!cronAuthorized(req))
     return res.status(401).json({ ok: false, message: "unauthorized" });
   const { username, date, reading } = req.body || {};
   if (
@@ -478,8 +502,7 @@ app.get("/api/daily-reading", auth, (req, res) => {
   res.json({ ok: true, date, reading });
 });
 app.get("/api/cron/studied-words", (req, res) => {
-  const token = req.headers["x-cron-token"];
-  if (!CRON_TOKEN || token !== CRON_TOKEN)
+  if (!cronAuthorized(req))
     return res.status(401).json({ ok: false, message: "unauthorized" });
   const { username, date } = req.query;
   if (!username || !date || !/^\d{4}-\d{2}-\d{2}$/.test(date))
