@@ -67,8 +67,8 @@ db.exec(`
 `);
 
 const USERNAME_RE = /^[a-zA-Z0-9_\u4e00-\u9fa5]{2,20}$/;
-// 新注册密码：至少 8 位；bcrypt 只取前 72 字节，超出部分会被忽略，所以直接拒绝。
-// 登录不受影响，旧的 4 位密码照常可用。
+// 新注册密码（与前端一致）：至少 8 个字符，按 Unicode 码点计数（一个 emoji、一个汉字都算 1 个）；
+// bcrypt 只取前 72 字节，超出部分会被忽略，所以超过 72 字节直接拒绝。登录不受影响，旧的 4 位密码照常可用。
 const MIN_PASSWORD_LENGTH = 8;
 const MAX_PASSWORD_BYTES = 72;
 // 用户不存在时也做一次 bcrypt 比较，避免靠响应时间判断用户名是否存在
@@ -76,6 +76,13 @@ let dummyPasswordHash = null;
 function dummyHash() {
   dummyPasswordHash ??= bcrypt.hashSync(crypto.randomBytes(16).toString("hex"), 10);
   return dummyPasswordHash;
+}
+// SQLite 唯一约束冲突（node:sqlite：errcode 2067 = SQLITE_CONSTRAINT_UNIQUE）
+function isUniqueViolation(error) {
+  return (
+    error?.errcode === 2067 ||
+    /UNIQUE constraint failed/.test(String(error?.message || ""))
+  );
 }
 // 定时任务令牌：恒定时间比较（先取 SHA-256 摘要，长度一致）
 function cronAuthorized(req) {
@@ -267,14 +274,15 @@ app.post("/api/register", authLimiter, async (req, res) => {
       ok: false,
       message: "用户名需为 2-20 位字母、数字、下划线或中文",
     });
-  if (password.length < MIN_PASSWORD_LENGTH)
-    return res
-      .status(400)
-      .json({ ok: false, message: `密码至少 ${MIN_PASSWORD_LENGTH} 位` });
+  if ([...password].length < MIN_PASSWORD_LENGTH)
+    return res.status(400).json({
+      ok: false,
+      message: `密码至少 ${MIN_PASSWORD_LENGTH} 个字符（一个 emoji 或汉字算 1 个）`,
+    });
   if (Buffer.byteLength(password, "utf8") > MAX_PASSWORD_BYTES)
     return res.status(400).json({
       ok: false,
-      message: "密码太长（最多 72 个英文字符或 24 个中文字）",
+      message: "密码太长：最多 72 字节（约 72 个英文字符或 24 个汉字）",
     });
   const exists = db
     .prepare("SELECT id FROM users WHERE username = ?")
@@ -284,11 +292,21 @@ app.post("/api/register", authLimiter, async (req, res) => {
       .status(409)
       .json({ ok: false, message: "用户名已存在，换一个吧" });
   const hash = await bcrypt.hash(password, 10);
-  const result = db
-    .prepare(
-      "INSERT INTO users (username, password_hash, created_at) VALUES (?, ?, ?)",
-    )
-    .run(username, hash, Date.now());
+  let result;
+  try {
+    result = db
+      .prepare(
+        "INSERT INTO users (username, password_hash, created_at) VALUES (?, ?, ?)",
+      )
+      .run(username, hash, Date.now());
+  } catch (error) {
+    // 上面的存在检查和插入之间隔着异步哈希：同名并发注册时，后插入的一个会撞唯一约束
+    if (isUniqueViolation(error))
+      return res
+        .status(409)
+        .json({ ok: false, message: "用户名已存在，换一个吧" });
+    throw error;
+  }
   const token = jwt.sign(
     { uid: Number(result.lastInsertRowid), username },
     JWT_SECRET,
@@ -733,18 +751,25 @@ app.post("/api/ai/chat", auth, aiLimiter, async (req, res) => {
 // AI 服务商自动识别：用户只给 Key，后端按顺序试三个服务商的 chat/completions，
 // 哪个返回 200 就说明 Key 属于它。只发最小的 ping 请求（max_tokens: 1），不耗什么 token。
 // URL 是写死的三个官方地址，不接受用户传地址，无 SSRF 风险。
-// 注意：OpenAI 与 DeepSeek 的 Key 都是 sk- 开头，光看格式分不出来，必须真去试。
+// 只验证用户指定的那一家：以前按顺序把同一个 Key 发给三家去试，会把一家的 Key 泄露给另外两家。
+// 前端现在按 Key 格式在本机识别，认不出就让用户手动选服务商。
 const AI_DETECT_CANDIDATES = [
   { id: "openai", label: "OpenAI", baseUrl: "https://api.openai.com/v1", model: "gpt-4o-mini" },
   { id: "deepseek", label: "DeepSeek 官方", baseUrl: "https://api.deepseek.com", model: "deepseek-flash" },
   { id: "hive", label: "Hive", baseUrl: "https://api-cdn.thehive.ai/api/v3", model: "deepseek-ai/deepseek-v4.1-flash-1017" },
 ];
 app.post("/api/ai/detect", auth, aiLimiter, async (req, res) => {
-  const { apiKey } = req.body || {};
+  const { apiKey, provider } = req.body || {};
   if (!apiKey || typeof apiKey !== "string" || !apiKey.trim())
     return res.status(400).json({ ok: false, message: "请先填写 API Key" });
+  const chosen = AI_DETECT_CANDIDATES.filter((cand) => cand.id === provider);
+  if (!chosen.length)
+    return res.status(400).json({
+      ok: false,
+      message: "请先选择服务商：Key 只会发给你选的那一家验证",
+    });
   const key = apiKey.trim();
-  for (const cand of AI_DETECT_CANDIDATES) {
+  for (const cand of chosen) {
     try {
       const url = new URL(cand.baseUrl.replace(/\/+$/, "") + "/chat/completions");
       const r = await fetch(url, {
@@ -769,7 +794,7 @@ app.post("/api/ai/detect", auth, aiLimiter, async (req, res) => {
   }
   return res
     .status(401)
-    .json({ ok: false, message: "这个 Key 在 OpenAI、DeepSeek、Hive 都没通过，请检查 Key 是否正确" });
+    .json({ ok: false, message: `这个 Key 在 ${chosen[0].label} 没通过，请检查 Key 和服务商是否正确` });
 });
 
 // Express also routes synchronous cron/SQLite failures here; clients always receive JSON.
